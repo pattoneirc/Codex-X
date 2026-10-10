@@ -95,7 +95,7 @@ function labelHash(value: string) {
   return `${(first >>> 0).toString(16)}-${(second >>> 0).toString(16)}`;
 }
 export function configHealthIssueKey(report: ConfigHealthReport) {
-  return labelHash(JSON.stringify(report.issues.map(({ code, title, description }) => [code, title, description]).sort()));
+  return labelHash(JSON.stringify(report.issues.map(({ code, title, description, key, suggestion, repairable }) => [code, title, description, key, suggestion, repairable]).sort()));
 }
 type StorageLike = Pick<Storage, "getItem" | "setItem">;
 export function createConfigHealthNoticeRegistry(storage?: StorageLike) {

@@ -125,3 +125,10 @@
 @keyframes cx-config-health-enter { from { opacity: 0; transform: translateY(-5px); } to { opacity: 1; transform: translateY(0); } }
 @keyframes cx-config-health-spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .cx-config-health-toast, .cx-config-health-spinner { animation: none; } }
+
+.cx-config-health-location { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; }
+.cx-config-health-location code,
+.cx-config-health-key code { color: var(--cx-health-text); font-size: 11px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.cx-config-health-location span { flex-shrink: 0; }
+.cx-config-health-issues p.cx-config-health-suggestion,
+.cx-config-health-toast-content p.cx-config-health-suggestion { color: var(--cx-health-text); }

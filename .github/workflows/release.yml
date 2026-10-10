@@ -186,6 +186,16 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.tag }}
 
+      - name: Checkout Windows test harness tooling
+        if: matrix.platform == 'windows-latest'
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.sha }}
+          path: .ci-tools
+          sparse-checkout: scripts/ensure-test-common-controls.ps1
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
       - name: Install Linux dependencies
         if: matrix.platform == 'ubuntu-22.04'
         run: |
@@ -221,9 +231,33 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Check frontend types and regressions
+        run: |
+          pnpm --dir apps/desktop typecheck
+          node --test apps/desktop/tests/*.test.mjs
+
+      - name: Verify Windows SDK test tooling
+        if: matrix.platform == 'windows-latest'
+        run: |
+          command -v openssl
+          openssl version
+
       - name: Test Windows filesystem compatibility
         if: matrix.platform == 'windows-latest'
-        run: cargo test --release --manifest-path apps/desktop/src-tauri/Cargo.toml --lib --locked -- --test-threads=1
+        shell: pwsh
+        run: |
+          $artifacts = Join-Path $env:RUNNER_TEMP 'codexx-test-artifacts.json'
+          cargo test --release --manifest-path apps/desktop/src-tauri/Cargo.toml --lib --locked --no-run --message-format=json > $artifacts
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $harness = ./.ci-tools/scripts/ensure-test-common-controls.ps1 -CargoJson $artifacts -OutputDirectory $env:RUNNER_TEMP | ConvertFrom-Json
+          Write-Host "Running all tests in $($harness.testExecutable)"
+          $env:PATH = "$(Split-Path -Parent $harness.testExecutable);$env:PATH"
+          Push-Location apps/desktop/src-tauri
+          try {
+            & $harness.testExecutable --test-threads=1
+            $testExitCode = $LASTEXITCODE
+          } finally { Pop-Location }
+          if ($testExitCode -ne 0) { exit $testExitCode }
 
       - name: Import Apple signing certificate and notarization key
         if: matrix.macos

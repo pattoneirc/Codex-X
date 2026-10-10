@@ -238,7 +238,8 @@ Codex-X 现在不只是“几套内置 Prompt”的启动器，而是一个可�
 - 保存多个可命名的官方 Codex 登录配置与第三方供应商，随时查看当前正在使用哪一个
 - 点击“复制”直接新增独立副本，无需确认或进入编辑页；名称可稍后修改
 - 切换前可检测连接，并可获取模型进行测试
-- 在同一页面编辑 Base URL、API Key、Model、Wire API 和完整 TOML
+- 在同一页面编辑 Base URL、API Key、Model、上游接口协议、Headers 和完整 TOML
+- 本地路由支持 Responses、Chat Completions、Claude Messages、Gemini 原生接口，使用方式与边界见[供应商协议说明](docs/PROVIDER_PROTOCOLS.md)
 - 从 cc-switch 导入时自动区分新增、更新、合并与跳过；相同 URL + Key 不再重复显示
 - 切回 OpenAI Official 时保留当前官方登录态，第三方配置也不会凭空消失
 

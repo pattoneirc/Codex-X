@@ -13,7 +13,7 @@ use std::fs;
 use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
-use toml_edit::{value, DocumentMut, Item, TableLike};
+use toml_edit::{value, DocumentMut, ImDocument, Item, Key, Table, TableLike};
 
 const MAX_CONFIG_BYTES: u64 = 2 * 1024 * 1024;
 const BUILTIN_PROVIDERS: &[&str] = &[
@@ -31,6 +31,11 @@ pub(crate) struct ConfigHealthIssue {
     pub(crate) title: String,
     pub(crate) description: String,
     pub(crate) repairable: bool,
+    pub(crate) path: String,
+    pub(crate) line: Option<usize>,
+    pub(crate) column: Option<usize>,
+    pub(crate) key: String,
+    pub(crate) suggestion: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -277,18 +282,35 @@ fn fingerprint(
     format!("{:x}", digest.finalize())
 }
 
+fn key_path(parts: &[&str]) -> String {
+    parts
+        .iter()
+        .map(|part| Key::new(*part).to_string())
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
 fn add_issue(
     report: &mut ConfigHealthReport,
     code: &str,
     title: &str,
     description: &str,
     repair: Option<&str>,
+    key: &[&str],
+    suggestion: &str,
 ) {
     report.issues.push(ConfigHealthIssue {
         code: code.to_string(),
         title: title.to_string(),
         description: description.to_string(),
         repairable: repair.is_some(),
+        path: config_path(Path::new(&report.codex_dir))
+            .display()
+            .to_string(),
+        line: None,
+        column: None,
+        key: key_path(key),
+        suggestion: suggestion.to_string(),
     });
     if let Some(summary) = repair {
         if !report
@@ -298,6 +320,136 @@ fn add_issue(
         {
             report.repair_summary.push(summary.to_string());
         }
+    }
+}
+
+fn line_column(text: &str, offset: usize) -> (usize, usize) {
+    let mut offset = offset.min(text.len());
+    while !text.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    let prefix = &text[..offset];
+    (
+        prefix.bytes().filter(|byte| *byte == b'\n').count() + 1,
+        prefix
+            .rsplit('\n')
+            .next()
+            .unwrap_or_default()
+            .chars()
+            .count()
+            + 1,
+    )
+}
+
+fn locate_issues(report: &mut ConfigHealthReport, source: &ImDocument<&str>) {
+    for issue in &mut report.issues {
+        let Ok(keys) = Key::parse(&issue.key) else {
+            continue;
+        };
+        let mut item = source.as_item();
+        let mut offset = None;
+        for (index, key) in keys.iter().enumerate() {
+            let Some(table) = item.as_table_like() else {
+                offset = None;
+                break;
+            };
+            let Some(next) = table.get(key.get()) else {
+                offset = None;
+                break;
+            };
+            if index + 1 == keys.len() {
+                offset = table
+                    .key(key.get())
+                    .and_then(Key::span)
+                    .map(|span| span.start)
+                    .or_else(|| next.span().map(|span| span.start));
+            }
+            item = next;
+        }
+        if let Some(offset) = offset {
+            let (line, column) = line_column(source.raw(), offset);
+            issue.line = Some(line);
+            issue.column = Some(column);
+        }
+    }
+}
+
+// Recover only TOML key names, never values or the parser's source-line display.
+// An invalid key/header is identified as document syntax rather than guessed.
+fn delimiter_outside_quotes(text: &str, delimiter: char) -> Option<usize> {
+    let mut quote = None;
+    let mut escaped = false;
+    for (offset, character) in text.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if quote == Some('"') && character == '\\' {
+            escaped = true;
+            continue;
+        }
+        if quote == Some(character) {
+            quote = None;
+            continue;
+        }
+        if quote.is_some() {
+            continue;
+        }
+        if character == '\'' || character == '"' {
+            quote = Some(character);
+        } else if character == delimiter {
+            return Some(offset);
+        } else if character == '#' {
+            return None;
+        }
+    }
+    None
+}
+
+fn syntax_key(text: &str, offset: usize) -> Vec<String> {
+    let error_line = line_column(text, offset).0;
+    let mut section: Vec<String> = Vec::new();
+    let mut current = vec!["<TOML 文档结构>".to_string()];
+    for line in text.lines().take(error_line) {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') {
+            let body = line.trim_start_matches('[');
+            let candidate = delimiter_outside_quotes(body, ']').map_or(body, |end| &body[..end]);
+            if let Ok(keys) = Key::parse(candidate) {
+                section = keys.iter().map(|key| key.get().to_string()).collect();
+                current = section.clone();
+            } else {
+                current = vec!["<TOML 表头>".to_string()];
+            }
+        } else if let Some(equal) = delimiter_outside_quotes(line, '=') {
+            if let Ok(keys) = Key::parse(line[..equal].trim()) {
+                current = section
+                    .iter()
+                    .cloned()
+                    .chain(keys.iter().map(|key| key.get().to_string()))
+                    .collect();
+            }
+        }
+    }
+    current
+}
+
+fn syntax_suggestion(message: &str) -> &'static str {
+    if message.contains("duplicate") {
+        "同一配置范围内的参数或表重复定义；保留一处正确定义，合并需要保留的内容后重新检查。"
+    } else if message.contains("string") || message.contains("quote") {
+        "检查此参数的引号是否成对；单行字符串不能直接换行，需换行时使用 TOML 三引号字符串。"
+    } else if message.contains("array") || message.contains("expected `]`") {
+        "检查此参数的数组是否以 ] 结束，各元素之间是否有逗号；修正后重新检查。"
+    } else if message.contains("table") || message.contains("expected `.`") {
+        "检查表头的方括号与点分参数名；例如 [model_providers.custom]，同一张表不能重复定义。"
+    } else if message.contains("expected `=`") {
+        "参数必须写成 参数名 = 值；补齐等号并使用 TOML 支持的值格式后重新检查。"
+    } else {
+        "检查标记位置的引号、逗号和括号是否配对，参数应写成 参数名 = 值；修正后重新检查。"
     }
 }
 
@@ -336,8 +488,10 @@ fn check_provider_table(
             report,
             "provider-table-type",
             "供应商配置格式不正确",
-            "有一条供应商配置不是有效的配置表，请在供应商页面重新检查配置。",
+            "此供应商的定义不是 TOML 配置表。",
             None,
+            &["model_providers", id],
+            "将此项改为 [model_providers.供应商标识] 配置表，并恢复原有参数；现有值无法确定，需手动确认。",
         );
         return;
     };
@@ -355,8 +509,10 @@ fn check_provider_table(
             report,
             "provider-name-missing",
             "供应商配置缺少名称",
-            "有一条供应商配置没有填写名称，可使用它现有的标识补齐显示名称。",
+            "此供应商的 name 缺失或为空。",
             (!id.trim().is_empty()).then_some("根据供应商标识补齐缺失的显示名称"),
+            &["model_providers", id, "name"],
+            &format!("补齐 name = {}，保留供应商标识与其他参数。", value(id)),
         );
     }
     for key in ["name", "base_url"] {
@@ -365,8 +521,14 @@ fn check_provider_table(
                 report,
                 "provider-text-type",
                 "供应商文字配置格式不正确",
-                "供应商名称或接口地址应为文字，暂时无法自动判断正确内容。",
+                &format!("{key} 应为 TOML 字符串，现有值的类型不正确。"),
                 None,
+                &["model_providers", id, key],
+                if key == "name" {
+                    "将 name 改为带引号的供应商显示名称，例如 name = \"My API\"。"
+                } else {
+                    "将 base_url 改为带引号的接口地址，例如 base_url = \"https://供应商地址/v1\"；地址需向供应商确认。"
+                },
             );
         }
     }
@@ -386,16 +548,20 @@ fn check_provider_table(
                     report,
                     "provider-boolean-text",
                     "供应商开关格式不正确",
-                    "有一项开关被写成了文字，可能导致 Codex 无法加载配置。",
+                    &format!("{key} 被写成了字符串，Codex 需要布尔值。"),
                     Some("将写成文字的开关恢复为正确格式"),
+                    &["model_providers", id, key],
+                    &format!("将 {key} 改为 {replacement}（不带引号），保留当前开关含义。"),
                 );
             } else {
                 add_issue(
                     report,
                     "provider-boolean-type",
                     "供应商开关无法识别",
-                    "有一项开关不是有效的开启或关闭值，需要手动确认。",
+                    &format!("{key} 不是布尔值，也无法确定其开启或关闭含义。"),
                     None,
+                    &["model_providers", id, key],
+                    &format!("确认所需状态后将 {key} 写为 true 或 false（不带引号）。"),
                 );
             }
         }
@@ -420,6 +586,8 @@ fn check_provider_table(
             "DeepSeek 的连接方式需要调整",
             "DeepSeek 官方接口不支持当前开启的 WebSocket 连接，可能先报错并多次重试，再正常回复。",
             Some("将 DeepSeek 官方接口改用 HTTP 连接，避免发送消息时反复重试"),
+            &["model_providers", id, "supports_websockets"],
+            "将 supports_websockets 改为 false，让 DeepSeek 官方接口使用 HTTP。",
         );
     }
     if let Some(item) = table.get_mut("wire_api") {
@@ -439,6 +607,8 @@ fn check_provider_table(
                 "供应商接口格式拼写不正确",
                 "接口格式中存在多余空格或大小写错误，可能导致 Codex 无法加载配置。",
                 Some("修正接口格式的空格或大小写"),
+                &["model_providers", id, "wire_api"],
+                "将 wire_api 规范为 \"responses\"，去掉多余空格并使用小写。",
             );
         } else {
             add_issue(
@@ -447,6 +617,8 @@ fn check_provider_table(
                 "供应商接口格式不受支持",
                 "当前 Codex 需要 Responses 接口。请向供应商确认支持的接口，或使用兼容的转接服务。",
                 None,
+                &["model_providers", id, "wire_api"],
+                "先向供应商确认支持 Responses API；支持时设置 wire_api = \"responses\"，否则选择兼容供应商。不能仅改名称来转换协议。",
             );
         }
     }
@@ -462,6 +634,8 @@ fn check_provider_table(
             "官方登录的认证设置不完整",
             "已发现官方登录信息，但这条官方供应商配置没有启用登录认证。",
             Some("为官方登录补齐认证开关"),
+            &["model_providers", id, "requires_openai_auth"],
+            "设置 requires_openai_auth = true，使用已确认的 ChatGPT 登录信息。",
         );
     }
 }
@@ -487,6 +661,64 @@ fn complete_alias_candidate(item: &Item) -> bool {
             || table.get("requires_openai_auth").and_then(Item::as_bool) == Some(true))
 }
 
+// A historical provider ID may be routed to the user's explicitly selected
+// official login only when neither root nor provider fields select other auth
+// or endpoints. No saved accounts, backups or credentials are borrowed.
+fn official_history_alias(doc: &DocumentMut, chatgpt_auth: bool) -> Option<Item> {
+    if !chatgpt_auth
+        || [
+            "base_url",
+            "experimental_bearer_token",
+            "auth",
+            "env_key",
+            "env_key_instructions",
+            "http_headers",
+            "env_http_headers",
+            "query_params",
+            "api_base",
+            "chatgpt_base_url",
+            "api_key",
+            "openai_api_key",
+            "auth_mode",
+            "tokens",
+            "env_vars",
+        ]
+        .iter()
+        .any(|key| doc.contains_key(key))
+    {
+        return None;
+    }
+    let providers = match doc.get("model_providers") {
+        None => None,
+        Some(item) => Some(item.as_table_like()?),
+    };
+    let selected = match doc.get("model_provider") {
+        Some(item) => item.as_str()?,
+        None => "openai",
+    };
+    if doc
+        .get("forced_login_method")
+        .is_some_and(|item| item.as_str() != Some("chatgpt"))
+    {
+        return None;
+    }
+    if let Some(item) = providers.and_then(|providers| providers.get(selected)) {
+        let table = item.as_table_like()?;
+        return (is_official_login_table(table, chatgpt_auth)
+            && !table.contains_key("query_params")
+            && complete_alias_candidate(item))
+        .then(|| item.clone());
+    }
+    if selected != "openai" {
+        return None;
+    }
+    let mut table = Table::new();
+    table.insert("name", value("OpenAI"));
+    table.insert("requires_openai_auth", value(true));
+    table.insert("wire_api", value("responses"));
+    Some(Item::Table(table))
+}
+
 fn collect_provider_reference(
     item: Option<&Item>,
     references: &mut Vec<String>,
@@ -500,6 +732,8 @@ fn collect_provider_reference(
             "选用的供应商设置不正确",
             "供应商标识应为非空文字，请在供应商页面重新选择后保存。",
             None,
+            &["model_provider"],
+            "将 model_provider 设置为已定义的非空供应商标识，例如 \"openai\" 或 [model_providers.custom] 对应的 \"custom\"；需先确认所选供应商。",
         );
         return;
     };
@@ -538,6 +772,8 @@ fn analyze(
                 "暂时无法检查配置",
                 message,
                 None,
+                &["<配置文件>"],
+                "检查显示路径对应文件的存在性、文件类型、读取权限与大小后重试。",
             );
             return (report, None);
         }
@@ -549,45 +785,36 @@ fn analyze(
             &mut report,
             "config-encoding",
             "配置文件的文字编码不正确",
-            "配置文件需要使用 UTF-8 编码，请手动检查后保存。",
+            "配置文件需要使用 UTF-8 编码。",
             None,
+            &["<文件编码>"],
+            "在文本编辑器中按原编码打开此文件，再以 UTF-8 编码保存；编码无法可靠判断，不能自动转换。",
         );
         return (report, None);
     };
-    let mut doc = match text.parse::<DocumentMut>() {
+    let source = match ImDocument::parse(text) {
         Ok(doc) => doc,
         Err(error) => {
             report.status = "issues";
-            // TOML's normal Display embeds entire source lines, including credentials.
-            let description = error
-                .span()
-                .map(|span| {
-                    let mut offset = span.start.min(text.len());
-                    while !text.is_char_boundary(offset) {
-                        offset -= 1;
-                    }
-                    let prefix = &text[..offset];
-                    let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
-                    let column = prefix
-                        .rsplit('\n')
-                        .next()
-                        .unwrap_or_default()
-                        .chars()
-                        .count()
-                        + 1;
-                    format!("配置文件第 {line} 行、第 {column} 列附近有格式错误，需要手动检查。")
-                })
-                .unwrap_or_else(|| "配置文件中存在格式错误，需要手动检查。".to_string());
+            let offset = error.span().map_or(0, |span| span.start);
+            let (line, column) = line_column(text, offset);
+            let keys = syntax_key(text, offset);
+            let keys: Vec<_> = keys.iter().map(String::as_str).collect();
             add_issue(
                 &mut report,
                 "config-syntax",
                 "配置文件格式不正确",
-                &description,
+                &format!("配置文件第 {line} 行、第 {column} 列附近存在 TOML 语法错误。"),
                 None,
+                &keys,
+                syntax_suggestion(error.message()),
             );
+            report.issues[0].line = Some(line);
+            report.issues[0].column = Some(column);
             return (report, None);
         }
     };
+    let mut doc = source.clone().into_mut();
     let mut references = Vec::new();
     collect_provider_reference(doc.get("model_provider"), &mut references, &mut report);
     // Profile loading changed between Codex versions. Leave legacy inline
@@ -602,8 +829,10 @@ fn analyze(
                 &mut report,
                 "providers-table-type",
                 "供应商列表格式不正确",
-                "model_providers 应为配置表，暂时无法自动恢复原有供应商。",
+                "model_providers 应为 TOML 配置表，现有值的类型不正确。",
                 None,
+                &["model_providers"],
+                "恢复 [model_providers.供应商标识] 配置表与原有参数；现有内容无法可靠还原，需手动确认。",
             );
         }
     }
@@ -640,9 +869,27 @@ fn analyze(
             .filter(|id| !BUILTIN_PROVIDERS.contains(id))
             .and_then(|id| providers.and_then(|providers| providers.get(id)))
             .is_some_and(complete_alias_candidate);
-        if missing.len() == 1 && candidates.len() == 1 && (!history_only || selected_custom_exists)
-        {
-            let source_name: String = candidates[0]
+        let official_alias = history_only
+            .then(|| official_history_alias(&doc, chatgpt_auth))
+            .flatten();
+        let selected_official_style = doc
+            .get("model_provider")
+            .and_then(Item::as_str)
+            .and_then(|id| providers.and_then(|providers| providers.get(id)))
+            .and_then(Item::as_table_like)
+            .is_some_and(|table| {
+                table.get("name").and_then(Item::as_str) == Some("OpenAI")
+                    && !table.contains_key("base_url")
+            });
+        let source = official_alias.clone().or_else(|| {
+            (missing.len() == 1
+                && candidates.len() == 1
+                && (!history_only || (selected_custom_exists && !selected_official_style)))
+                .then(|| candidates[0].clone())
+        });
+        let first_routing_summary = report.repair_summary.len();
+        if let Some(source) = source {
+            let source_name: String = source
                 .as_table_like()
                 .and_then(|table| table.get("name"))
                 .and_then(Item::as_str)
@@ -651,38 +898,51 @@ fn analyze(
                 .filter(|ch| !ch.is_control())
                 .take(60)
                 .collect();
-            doc.get_mut("model_providers")
-                .and_then(Item::as_table_like_mut)
-                .expect("candidate implies table")
-                .insert(&missing[0], candidates[0].clone());
-            if history_only {
-                let summary =
-                    format!("让受影响的旧会话沿用当前供应商「{source_name}」，并保留原会话");
-                add_issue(&mut report, "session-provider-definition-missing", "旧会话使用的供应商缺少配置", &format!("有些旧会话仍引用已缺失的供应商。修复后，这些会话将沿用当前供应商「{source_name}」，原会话会保留。"), Some(&summary));
-            } else {
-                let summary = format!("使用现有供应商「{source_name}」的配置补齐缺失的对应关系");
-                add_issue(&mut report, "provider-definition-missing", "选用的供应商缺少配置", &format!("供应商标识与现有配置不对应。将使用现有供应商「{source_name}」的配置补齐对应关系，并保留原配置。"), Some(&summary));
+            if doc.get("model_providers").is_none() {
+                doc.as_table_mut()
+                    .insert("model_providers", Item::Table(Table::new()));
             }
-            // Keep routing decisions visible in the compact startup notice.
-            if let Some(summary) = report.repair_summary.pop() {
-                report.repair_summary.insert(0, summary);
+            for id in &missing {
+                doc.get_mut("model_providers")
+                    .and_then(Item::as_table_like_mut)
+                    .expect("safe source requires a valid provider table")
+                    .insert(id, source.clone());
+                let summary = if history_only {
+                    format!("补齐 [model_providers.{}]，让旧会话沿用当前供应商「{source_name}」，并保留原会话", Key::new(id.as_str()))
+                } else {
+                    format!(
+                        "使用现有供应商「{source_name}」补齐 [model_providers.{}]，并保留原配置",
+                        Key::new(id.as_str())
+                    )
+                };
+                let description = if history_only {
+                    format!("旧会话仍引用供应商标识 {}，但 config.toml 中缺少对应的配置表。修复后，这些会话将沿用当前供应商「{source_name}」。", Key::new(id.as_str()))
+                } else {
+                    format!(
+                        "model_provider 选中的供应商 {} 缺少对应的配置表。",
+                        Key::new(id.as_str())
+                    )
+                };
+                add_issue(&mut report,
+                    if history_only { "session-provider-definition-missing" } else { "provider-definition-missing" },
+                    if history_only { "旧会话使用的供应商缺少配置" } else { "选用的供应商缺少配置" },
+                    &description, Some(&summary), &["model_providers", id],
+                    &format!("新增 {}，复制已确认的当前{}供应商「{source_name}」参数；保留 model_provider、原有表和会话数据库。",
+                        key_path(&["model_providers", id]), if official_alias.is_some() { "官方登录" } else { "" }));
             }
+            // Keep all routing decisions before smaller value corrections.
+            let routing = report.repair_summary.split_off(first_routing_summary);
+            report.repair_summary.splice(0..0, routing);
         } else {
-            add_issue(
-                &mut report,
-                if history_only {
-                    "session-provider-definition-missing"
-                } else {
-                    "provider-definition-missing"
-                },
-                if history_only {
-                    "旧会话使用的供应商缺少配置"
-                } else {
-                    "选用的供应商缺少配置"
-                },
-                "未找到唯一可确认的供应商配置，请在供应商页面重新选择并启用，或手动补齐原配置。",
-                None,
-            );
+            for id in &missing {
+                add_issue(&mut report,
+                    if history_only { "session-provider-definition-missing" } else { "provider-definition-missing" },
+                    if history_only { "旧会话使用的供应商缺少配置" } else { "选用的供应商缺少配置" },
+                    &format!("{} 引用了供应商标识 {}，但 {} 未定义，且无法确认应使用哪个来源。",
+                        if history_only { "旧会话" } else { "model_provider" }, Key::new(id.as_str()), key_path(&["model_providers", id])),
+                    None, &["model_providers", id],
+                    &format!("手动补齐 [{}] 的原供应商参数；若希望旧会话改用官方，请先启用官方配置并完成 ChatGPT 登录后重新检查。多个中转来源不会自动合并。", key_path(&["model_providers", id])));
+            }
         }
     }
     report.status = if report.issues.is_empty() {
@@ -704,10 +964,13 @@ fn analyze(
             &mut report,
             "config-linked-file",
             "配置文件由链接指向其他位置",
-            "请打开原配置文件进行修改，以保留已有的文件链接。",
+            "此 config.toml 是文件链接，不能安全替换链接本身。",
             None,
+            &["<文件链接>"],
+            "使用「查看配置」打开链接指向的原文件，按上述参数建议修复后重新检查。",
         );
     }
+    locate_issues(&mut report, &source);
     let replacement = report.can_repair.then(|| doc.to_string());
     (report, replacement)
 }
@@ -1163,7 +1426,263 @@ mod tests {
         assert_eq!(report.status, "issues");
         assert!(json.contains("第 2 行"));
         assert!(!json.contains("super-private-secret"));
-        assert!(!json.contains("experimental_bearer_token"));
+        let issue = &report.issues[0];
+        assert_eq!(issue.path, config_path(&fixture.0).display().to_string());
+        assert_eq!(issue.line, Some(2));
+        assert!(issue.column.is_some_and(|column| column > 0));
+        assert_eq!(issue.key, "experimental_bearer_token");
+        assert!(!issue.suggestion.is_empty());
+        assert!(!issue.repairable);
+    }
+
+    #[test]
+    fn diagnostics_locate_the_original_parameter_and_give_an_exact_fix() {
+        let fixture = Fixture::new("# 注释\nmodel_provider='custom'\n[model_providers.custom]\nname='My API'\nbase_url='https://fixture.example/v1'\n  supports_websockets = 'TRUE' # 保留\nwire_api = 'chat'\n");
+        let report = fixture.check();
+        let boolean = report
+            .issues
+            .iter()
+            .find(|issue| issue.code == "provider-boolean-text")
+            .unwrap();
+        assert_eq!(boolean.path, config_path(&fixture.0).display().to_string());
+        assert_eq!((boolean.line, boolean.column), (Some(6), Some(3)));
+        assert_eq!(boolean.key, "model_providers.custom.supports_websockets");
+        assert!(boolean.suggestion.contains("supports_websockets 改为 true"));
+        let protocol = report
+            .issues
+            .iter()
+            .find(|issue| issue.code == "provider-protocol-unsupported")
+            .unwrap();
+        assert_eq!((protocol.line, protocol.column), (Some(7), Some(1)));
+        assert_eq!(protocol.key, "model_providers.custom.wire_api");
+        assert!(protocol.suggestion.contains("Responses API"));
+        assert!(!protocol.repairable);
+    }
+
+    #[test]
+    fn dotted_inline_and_quoted_provider_keys_keep_precise_locations() {
+        for (text, line, column) in [
+            ("model_providers.\"with.dot\".name=9\n", 1, 28),
+            ("model_providers = { \"with.dot\" = { name = 9 } }\n", 1, 36),
+            ("[model_providers.\"with.dot\"]\nname=9\n", 2, 1),
+        ] {
+            let fixture = Fixture::new(text);
+            let report = fixture.check();
+            let issue = report
+                .issues
+                .iter()
+                .find(|issue| issue.code == "provider-text-type")
+                .unwrap();
+            assert_eq!(issue.key, "model_providers.\"with.dot\".name");
+            assert_eq!(
+                (issue.line, issue.column),
+                (Some(line), Some(column)),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_definition_has_no_invented_line_and_names_each_provider() {
+        let fixture = Fixture::new("model_provider='openai'\n");
+        fixture.sessions(&["old_proxy_a", "old_proxy_b"]);
+        let report = fixture.check();
+        assert_eq!(report.issues.len(), 2);
+        assert!(!report.can_repair);
+        for issue in &report.issues {
+            assert_eq!(issue.path, config_path(&fixture.0).display().to_string());
+            assert_eq!((issue.line, issue.column), (None, None));
+            assert!(issue.key.starts_with("model_providers.old_proxy_"));
+            assert!(issue.description.contains(&issue.key));
+            assert!(issue.suggestion.contains(&issue.key));
+        }
+    }
+
+    #[test]
+    fn syntax_errors_include_parameter_context_and_safe_actionable_suggestions() {
+        let text = "model_provider='custom'\n[model_providers.custom]\nname='OpenAI'\nexperimental_bearer_token = 'never-echo-this-secret\n";
+        let fixture = Fixture::new(text);
+        let report = fixture.check();
+        let issue = &report.issues[0];
+        assert_eq!(
+            issue.key,
+            "model_providers.custom.experimental_bearer_token"
+        );
+        assert_eq!(issue.line, Some(4));
+        assert!(issue.column.is_some());
+        assert!(issue.suggestion.contains("引号"));
+        assert!(!serde_json::to_string(&report)
+            .unwrap()
+            .contains("never-echo-this-secret"));
+        assert!(!fixture.repair(&report).changed);
+        assert_eq!(fixture.text(), text);
+        assert!(!fixture.0.join(".codexx-test-backups").exists());
+    }
+
+    #[test]
+    fn syntax_context_respects_delimiters_inside_quoted_keys() {
+        let text = "[model_providers.\"name]with=chars\"]\n\"key=with]chars\" = 'secret-without-closing-quote\n";
+        let keys = syntax_key(text, text.len() - 1);
+        assert_eq!(
+            keys,
+            ["model_providers", "name]with=chars", "key=with]chars"]
+        );
+        assert!(!key_path(&keys.iter().map(String::as_str).collect::<Vec<_>>()).contains("secret"));
+    }
+
+    #[test]
+    fn builtin_official_login_can_repair_all_missing_history_aliases_without_touching_sessions() {
+        for selection in ["model_provider='openai'\n", ""] {
+            let original = format!(
+                "{selection}model='official-model'\n[mcp_servers.fixture]\ncommand='fixture-mcp'\n"
+            );
+            let fixture = Fixture::new(&original);
+            fixture.login();
+            fixture.sessions(&["old_proxy_a", "old_proxy_b", "openai"]);
+            let db_before = fs::read(fixture.0.join("state_5.sqlite")).unwrap();
+            let auth_before = fs::read(auth_path(&fixture.0)).unwrap();
+            let report = fixture.check();
+            assert!(report.can_repair);
+            assert_eq!(report.issues.len(), 2);
+            assert!(report
+                .repair_summary
+                .iter()
+                .all(|summary| summary.contains("OpenAI")));
+            assert_eq!(fixture.text(), original);
+            let repaired = fixture.repair(&report);
+            assert!(repaired.changed);
+            assert_eq!(repaired.report.status, "healthy");
+            let backup = fixture
+                .0
+                .join(".codexx-test-backups")
+                .join(repaired.backup_id.unwrap())
+                .join("config.toml");
+            assert_eq!(fs::read_to_string(backup).unwrap(), original);
+            let doc = fixture.text().parse::<DocumentMut>().unwrap();
+            assert_eq!(
+                doc.get("model_provider").and_then(Item::as_str),
+                if selection.is_empty() {
+                    None
+                } else {
+                    Some("openai")
+                }
+            );
+            assert_eq!(doc["model"].as_str(), Some("official-model"));
+            assert_eq!(
+                doc["mcp_servers"]["fixture"]["command"].as_str(),
+                Some("fixture-mcp")
+            );
+            for id in ["old_proxy_a", "old_proxy_b"] {
+                assert_eq!(doc["model_providers"][id]["name"].as_str(), Some("OpenAI"));
+                assert_eq!(
+                    doc["model_providers"][id]["wire_api"].as_str(),
+                    Some("responses")
+                );
+                assert_eq!(
+                    doc["model_providers"][id]["requires_openai_auth"].as_bool(),
+                    Some(true)
+                );
+                assert!(doc["model_providers"][id]
+                    .as_table_like()
+                    .unwrap()
+                    .get("base_url")
+                    .is_none());
+            }
+            assert_eq!(
+                fs::read(fixture.0.join("state_5.sqlite")).unwrap(),
+                db_before
+            );
+            assert_eq!(fs::read(auth_path(&fixture.0)).unwrap(), auth_before);
+            assert!(!fixture.repair(&repaired.report).changed);
+        }
+    }
+
+    #[test]
+    fn selected_custom_official_login_can_repair_history_with_multiple_inactive_sources() {
+        let original = "model_provider='custom'\n[model_providers.custom]\nname='OpenAI'\nrequires_openai_auth=true\nsupports_websockets=true\nwire_api='responses'\n[model_providers.inactive]\nname='Inactive proxy'\nbase_url='https://inactive.fixture/v1'\n";
+        let fixture = Fixture::new(original);
+        fixture.login();
+        fixture.sessions(&["old_proxy_a", "old_proxy_b"]);
+        let report = fixture.check();
+        assert!(report.can_repair);
+        assert_eq!(fixture.repair(&report).report.status, "healthy");
+        let doc = fixture.text().parse::<DocumentMut>().unwrap();
+        assert_eq!(doc["model_provider"].as_str(), Some("custom"));
+        assert_eq!(
+            doc["model_providers"]["old_proxy_a"]["supports_websockets"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            doc["model_providers"]["inactive"]["base_url"].as_str(),
+            Some("https://inactive.fixture/v1")
+        );
+    }
+
+    #[test]
+    fn official_history_repair_requires_login_and_unambiguous_current_routing() {
+        for text in [
+            "model_provider='openai'\n",
+            "model_provider='custom'\n[model_providers.custom]\nname='OpenAI'\nrequires_openai_auth=true\nwire_api='responses'\n",
+        ] {
+            let fixture = Fixture::new(text);
+            fixture.sessions(&["old_proxy"]);
+            assert!(!fixture.check().can_repair, "{text}");
+            assert_eq!(fixture.text(), text);
+        }
+        for root in [
+            "base_url='https://proxy.fixture'",
+            "env_key='FIXTURE_API_KEY'",
+            "http_headers={Authorization='Bearer fixture'}",
+            "forced_login_method='api'",
+            "model_provider=5",
+        ] {
+            let original = if root.starts_with("model_provider") {
+                format!("{root}\n")
+            } else {
+                format!("model_provider='openai'\n{root}\n")
+            };
+            let fixture = Fixture::new(&original);
+            fixture.login();
+            fixture.sessions(&["old_proxy"]);
+            let report = fixture.check();
+            assert!(!report.can_repair, "{root}");
+            assert!(!fixture.repair(&report).changed);
+            assert_eq!(fixture.text(), original);
+        }
+        for extra in [
+            "env_key='FIXTURE_API_KEY'",
+            "http_headers={Authorization='Bearer fixture'}",
+            "query_params={token='fixture'}",
+        ] {
+            let original = format!("model_provider='custom'\n[model_providers.custom]\nname='OpenAI'\nrequires_openai_auth=true\nwire_api='responses'\n{extra}\n");
+            let fixture = Fixture::new(&original);
+            fixture.login();
+            fixture.sessions(&["old_proxy"]);
+            assert!(!fixture.check().can_repair, "{extra}");
+            assert_eq!(fixture.text(), original);
+        }
+    }
+
+    #[test]
+    fn login_removal_and_external_edit_cancel_official_alias_repairs() {
+        let original = "model_provider='openai'\n";
+        let fixture = Fixture::new(original);
+        fixture.login();
+        fixture.sessions(&["old_proxy"]);
+        let report = fixture.check();
+        assert!(report.can_repair);
+        let result = repair_with_before_write(&fixture.0, &report.fingerprint, || {
+            fs::remove_file(auth_path(&fixture.0)).unwrap();
+        });
+        assert!(result.is_err());
+        assert_eq!(fixture.text(), original);
+        fixture.login();
+        let report = fixture.check();
+        let result = repair_with_before_write(&fixture.0, &report.fingerprint, || {
+            fs::write(config_path(&fixture.0), "# external edit\n").unwrap();
+        });
+        assert!(result.is_err());
+        assert_eq!(fixture.text(), "# external edit\n");
     }
 
     #[test]

@@ -39,7 +39,36 @@ jobs:
           cache-on-failure: true
       - run: pnpm install --frozen-lockfile
       - run: pnpm --dir apps/desktop typecheck
-      - run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --lib --locked -- --test-threads=1
+      - run: node --test apps/desktop/tests/*.test.mjs
+      - name: Verify SDK TLS fixture tooling
+        run: |
+          $openssl = Get-Command openssl -ErrorAction Stop
+          & $openssl.Source version
+      - name: Run Windows release tests
+        run: |
+          $artifacts = Join-Path $env:RUNNER_TEMP 'codexx-test-artifacts.json'
+          cargo test --release --manifest-path apps/desktop/src-tauri/Cargo.toml --lib --locked --no-run --message-format=json > $artifacts
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $harness = ./scripts/ensure-test-common-controls.ps1 -CargoJson $artifacts -OutputDirectory $env:RUNNER_TEMP | ConvertFrom-Json
+          Write-Host "Running all tests in $($harness.testExecutable)"
+          $env:PATH = "$(Split-Path -Parent $harness.testExecutable);$env:PATH"
+          Push-Location apps/desktop/src-tauri
+          try {
+            & $harness.testExecutable --test-threads=1
+            $testExitCode = $LASTEXITCODE
+          } finally { Pop-Location }
+          if ($testExitCode -ne 0) { exit $testExitCode }
+      - name: Diagnose failed Windows test loader
+        if: failure()
+        run: ./scripts/windows-dll-diagnostics.ps1 -RunHarnessList
+      - name: Retain Windows loader diagnostics
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-loader-diagnostics
+          path: ${{ runner.temp }}/codexx-dll-diagnostics
+          retention-days: 7
+          if-no-files-found: warn
       - name: Build test installer without publishing or release signing credentials
         run: |
           Set-Content -Path "$env:RUNNER_TEMP\installer-check.json" -Value '{"bundle":{"createUpdaterArtifacts":false}}' -Encoding utf8

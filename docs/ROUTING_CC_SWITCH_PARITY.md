@@ -2,7 +2,7 @@
 
 本说明记录 Codex-X 本轮路由实现与 CC Switch 的对应关系，供维护者检查行为和后续回归使用。
 入口为「设置 → 路由与故障转移」。本轮对齐 Codex 的监听、接管、优先队列、请求重试、熔断和
-原生官方账号路由；不等于移植 CC Switch 的全部应用适配器和请求转换功能。
+原生官方账号路由。新增 Chat Completions、Claude Messages 与 Gemini 上游转换见[供应商协议说明](PROVIDER_PROTOCOLS.md)。
 
 参考版本固定为 CC Switch 提交
 [`06082e189d65e6d6dbadc35dacdac1ce6c79d89a`](https://github.com/farion1231/cc-switch/tree/06082e189d65e6d6dbadc35dacdac1ce6c79d89a)
@@ -19,7 +19,7 @@
 | `autoFailoverEnabled` | `false` | 对第三方 API 请求使用完整优先队列；关闭时只使用当前供应商。 |
 
 - 首次开启自动故障转移要求服务与接管均已开启。保存设置、让开关从关变为开时立即启用队列 P1。
-- 关闭接管会先恢复直连，监听服务可以继续运行。关闭路由总开关会恢复直连并关闭接管，
+- 原生 Responses 供应商关闭接管会先恢复直连，监听服务可以继续运行。关闭路由总开关会恢复直连并关闭接管，
   但保留自动故障转移偏好、队列和参数。
 - 官方登录使用独立的原生官方路由，自动队列暂不参与；这不要求删除原有第三方队列。
 - 手动切换第三方供应商、编辑当前配置、切换官方账号时，完整原操作包在
@@ -176,10 +176,11 @@ HTTP 400–599 中，以下状态不进入候补重试：`400/405/406/413/414/41
 
 ## 适用边界与实现差异
 
-- 当前数据面提供 `POST /v1/responses`、`POST /v1/responses/compact`、`GET /v1/models`，使用 HTTP/SSE，
+- 当前数据面提供 `POST /v1/responses`、`GET /v1/models`；原生 Responses 上游另支持 `POST /v1/responses/compact`。使用 HTTP/SSE，
   不提供 WebSocket 升级或任意 URL 转发。
-- 第三方接口需兼容 Responses。没有 Chat Completions／Anthropic 协议转换、请求整流器、图片降级、
-  Claude/Gemini/Grok 应用接管或跨应用配置管理；不能把这些上游能力写成本项目已具备。
+- 原生 Responses 直接转发，Chat Completions／Claude Messages／Gemini 原生接口通过本地路由转换。
+  转换接口不支持 Responses 的服务端状态与 `/compact`；具体范围见[供应商协议说明](PROVIDER_PROTOCOLS.md)。
+  不提供 Claude/Gemini/Grok 应用接管或跨应用配置管理。
 - 队列不限制模型名称，但不保证任意第三方都支持请求中的模型、工具或服务端状态。
   厂商专用 `query_params` 目前不支持自动路由；无效认证、缺失环境变量或不适用的认证头会报告原因。
 - 本地监听即使绑定非回环地址，也保留随机令牌、Host 和来源检查。不是无需认证的公开代理。

@@ -27,6 +27,7 @@ impl Fixture {
                 api_key: Some(format!("fixture-provider-secret-{index}")),
                 toml_config: None,
                 wire_api: "responses".into(),
+                upstream_api: None,
                 requires_openai_auth: false,
                 model_mappings: vec![],
             };
@@ -371,6 +372,407 @@ fn failed_manual_switch_reattaches_original_route() {
     let status = get_status(fixture.scope()).unwrap();
     assert!(status.running && status.takeover_active);
     assert_eq!(status.primary.unwrap().id, fixture.providers[0].id);
+}
+
+#[test]
+fn converted_provider_requires_live_takeover_and_shutdown_preserves_bridge() {
+    let _guard = crate::app_db::test_db_guard();
+    let mut fixture = Fixture::new();
+    fixture.providers[1].upstream_api = Some("gemini".into());
+    fixture.providers[1] =
+        crate::providers::save_provider_inner(fixture.providers[1].clone()).unwrap();
+    assert!(ensure_conversion_route(fixture.scope(), &fixture.providers[1]).is_err());
+    fixture.enable();
+    ensure_conversion_route(fixture.scope(), &fixture.providers[1]).unwrap();
+    with_provider_change(fixture.scope(), || {
+        crate::providers::activate_saved_provider_inner(
+            fixture.scope(),
+            fixture.providers[1].id.clone(),
+        )
+    })
+    .unwrap();
+    let before = FileCheckpoint::capture(&fixture.dir).unwrap();
+    let mut disabled = get_status(fixture.scope()).unwrap().settings;
+    disabled.router_enabled = false;
+    assert!(save_settings(fixture.scope(), disabled)
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("协议转换"));
+    shutdown_all().unwrap();
+    let after = FileCheckpoint::capture(&fixture.dir).unwrap();
+    assert_eq!(before.config, after.config);
+    assert_eq!(before.auth, after.auth);
+    assert_eq!(before.selected, after.selected);
+    assert!(!get_status(fixture.scope()).unwrap().running);
+    assert!(fixture.text().contains("127.0.0.1"));
+    resume_after_failed_update().unwrap();
+    assert!(get_status(fixture.scope()).unwrap().takeover_active);
+    with_provider_change(fixture.scope(), || {
+        crate::providers::activate_saved_provider_inner(
+            fixture.scope(),
+            fixture.providers[0].id.clone(),
+        )
+    })
+    .unwrap();
+    stop(&fixture);
+    assert!(!get_status(fixture.scope()).unwrap().running);
+}
+
+#[test]
+fn shutdown_preflight_is_read_only_for_native_and_converted_routes() {
+    let _guard = crate::app_db::test_db_guard();
+    let mut fixture = Fixture::new();
+    fixture.enable();
+    let before = FileCheckpoint::capture(&fixture.dir).unwrap();
+    assert!(!SHUTTING_DOWN.load(Ordering::Acquire));
+    ensure_shutdown_allowed().unwrap();
+    assert!(!SHUTTING_DOWN.load(Ordering::Acquire));
+    assert_eq!(
+        before.config,
+        FileCheckpoint::capture(&fixture.dir).unwrap().config
+    );
+    fixture.providers[1].upstream_api = Some("gemini".into());
+    fixture.providers[1] =
+        crate::providers::save_provider_inner(fixture.providers[1].clone()).unwrap();
+    with_provider_change(fixture.scope(), || {
+        crate::providers::activate_saved_provider_inner(
+            fixture.scope(),
+            fixture.providers[1].id.clone(),
+        )
+    })
+    .unwrap();
+    let before = FileCheckpoint::capture(&fixture.dir).unwrap();
+    let (routes, revision, instance) = {
+        let runtimes = lock_manager().unwrap();
+        let runtime = runtimes.get(&fixture.dir).unwrap();
+        (
+            runtime.routes.clone(),
+            runtime.proxy.revision(),
+            runtime.instance_id,
+        )
+    };
+    for flag in [false, true] {
+        SHUTTING_DOWN.store(flag, Ordering::Release);
+        ensure_shutdown_allowed().unwrap();
+        assert_eq!(SHUTTING_DOWN.load(Ordering::Acquire), flag);
+        let after = FileCheckpoint::capture(&fixture.dir).unwrap();
+        assert_eq!(before.config, after.config);
+        assert_eq!(before.auth, after.auth);
+        assert_eq!(before.selected, after.selected);
+        let runtimes = lock_manager().unwrap();
+        let runtime = runtimes.get(&fixture.dir).unwrap();
+        assert!(runtime.routes == routes);
+        assert_eq!(runtime.proxy.revision(), revision);
+        assert_eq!(runtime.instance_id, instance);
+        assert!(runtime.journal.is_some());
+    }
+    SHUTTING_DOWN.store(false, Ordering::Release);
+}
+
+fn converted_fixture(api: &str) -> Fixture {
+    let mut fixture = Fixture::new();
+    fixture.providers[1].upstream_api = Some(api.into());
+    fixture.providers[1] =
+        crate::providers::save_provider_inner(fixture.providers[1].clone()).unwrap();
+    let mut settings = fixture.settings();
+    settings.auto_failover_enabled = false;
+    save_settings(fixture.scope(), settings).unwrap();
+    with_provider_change(fixture.scope(), || {
+        crate::providers::activate_saved_provider_inner(
+            fixture.scope(),
+            fixture.providers[1].id.clone(),
+        )
+    })
+    .unwrap();
+    fixture
+}
+
+#[test]
+fn converted_normal_exit_restarts_the_owned_bridge_without_direct_restore() {
+    let _guard = crate::app_db::test_db_guard();
+    let fixture = converted_fixture("gemini");
+    let before = FileCheckpoint::capture(&fixture.dir).unwrap();
+    let settings = get_status(fixture.scope()).unwrap().settings;
+    ensure_shutdown_allowed().unwrap();
+    shutdown_all().unwrap();
+    let after = FileCheckpoint::capture(&fixture.dir).unwrap();
+    assert_eq!(before.config, after.config);
+    assert_eq!(before.auth, after.auth);
+    assert_eq!(before.selected, after.selected);
+    assert!(!lock_manager().unwrap().contains_key(&fixture.dir));
+    assert!(SHUTTING_DOWN.load(Ordering::Acquire));
+    let called = std::cell::Cell::new(false);
+    assert!(with_provider_change(fixture.scope(), || {
+        called.set(true);
+        Ok(())
+    })
+    .is_err());
+    assert!(!called.get());
+    SHUTTING_DOWN.store(false, Ordering::Release);
+    initialize().unwrap();
+    let status = get_status(fixture.scope()).unwrap();
+    assert!(status.running && status.takeover_active);
+    assert_eq!(status.settings, settings);
+    let runtimes = lock_manager().unwrap();
+    let runtime = runtimes.get(&fixture.dir).unwrap();
+    assert_eq!(runtime.routes[0].protocol, UpstreamApi::Gemini);
+    assert!(runtime.journal.as_ref().unwrap().requires_conversion);
+}
+
+#[test]
+fn update_handoff_freezes_mutations_without_stopping_native_or_converted_listener() {
+    let _guard = crate::app_db::test_db_guard();
+    for conversion in [false, true] {
+        let fixture = if conversion {
+            converted_fixture("anthropic_messages")
+        } else {
+            let fixture = Fixture::new();
+            fixture.enable();
+            fixture
+        };
+        let before = FileCheckpoint::capture(&fixture.dir).unwrap();
+        let (revision, instance) = {
+            let runtimes = lock_manager().unwrap();
+            let runtime = runtimes.get(&fixture.dir).unwrap();
+            (runtime.proxy.revision(), runtime.instance_id)
+        };
+        begin_update_handoff().unwrap();
+        assert!(SHUTTING_DOWN.load(Ordering::Acquire));
+        let called = std::cell::Cell::new(false);
+        assert!(with_provider_change(fixture.scope(), || {
+            called.set(true);
+            fs::write(crate::config_path(&fixture.dir), "changed").unwrap();
+            Ok(())
+        })
+        .is_err());
+        assert!(!called.get());
+        assert!(save_settings(fixture.scope(), fixture.settings()).is_err());
+        assert!(refresh_saved_routes().is_err());
+        let after = FileCheckpoint::capture(&fixture.dir).unwrap();
+        assert_eq!(before.config, after.config);
+        assert_eq!(before.auth, after.auth);
+        assert_eq!(before.selected, after.selected);
+        {
+            let runtimes = lock_manager().unwrap();
+            let runtime = runtimes.get(&fixture.dir).unwrap();
+            assert_eq!(runtime.proxy.revision(), revision);
+            assert_eq!(runtime.instance_id, instance);
+            assert!(runtime.journal.is_some());
+        }
+        resume_after_failed_update().unwrap();
+        assert!(!SHUTTING_DOWN.load(Ordering::Acquire));
+        {
+            let runtimes = lock_manager().unwrap();
+            let runtime = runtimes.get(&fixture.dir).unwrap();
+            assert_eq!(runtime.proxy.revision(), revision);
+            assert_eq!(runtime.instance_id, instance);
+        }
+        with_provider_change(fixture.scope(), || Ok(())).unwrap();
+        assert!(get_status(fixture.scope()).unwrap().takeover_active);
+    }
+}
+
+#[test]
+fn converted_stopped_update_handoff_resumes_the_same_protocol_and_settings() {
+    let _guard = crate::app_db::test_db_guard();
+    let fixture = converted_fixture("anthropic_messages");
+    let before = FileCheckpoint::capture(&fixture.dir).unwrap();
+    let settings = get_status(fixture.scope()).unwrap().settings;
+    shutdown_all().unwrap();
+    assert!(!lock_manager().unwrap().contains_key(&fixture.dir));
+    assert_eq!(
+        before.config,
+        FileCheckpoint::capture(&fixture.dir).unwrap().config
+    );
+    resume_after_failed_update().unwrap();
+    assert!(!SHUTTING_DOWN.load(Ordering::Acquire));
+    let status = get_status(fixture.scope()).unwrap();
+    assert!(status.running && status.takeover_active);
+    assert_eq!(status.settings, settings);
+    assert_eq!(
+        lock_manager().unwrap().get(&fixture.dir).unwrap().routes[0].protocol,
+        UpstreamApi::AnthropicMessages
+    );
+    assert_eq!(
+        before.auth,
+        FileCheckpoint::capture(&fixture.dir).unwrap().auth
+    );
+}
+
+#[test]
+fn converted_shutdown_keeps_external_selection_and_does_not_reattach_it() {
+    let _guard = crate::app_db::test_db_guard();
+    let fixture = converted_fixture("gemini");
+    let mut doc = parsed(&fixture);
+    doc["model_provider"] = value("external");
+    let mut table = Table::new();
+    table["name"] = value("External fixture");
+    table["base_url"] = value("https://external-fixture.example.test/v1");
+    table["wire_api"] = value("responses");
+    table["requires_openai_auth"] = value(false);
+    replace_table(&mut doc, "external", table).unwrap();
+    let external = doc.to_string();
+    fs::write(crate::config_path(&fixture.dir), &external).unwrap();
+    shutdown_all().unwrap();
+    assert_eq!(fixture.text(), external);
+    assert!(!load_record(&fixture.dir).unwrap().settings.takeover_enabled);
+    SHUTTING_DOWN.store(false, Ordering::Release);
+    initialize().unwrap();
+    assert_eq!(fixture.text(), external);
+    let runtime = lock_manager().unwrap().remove(&fixture.dir).unwrap();
+    assert!(runtime.journal.is_none());
+    runtime.proxy.shutdown();
+}
+
+#[test]
+fn converted_shutdown_failure_keeps_files_listener_and_mutation_gate_open() {
+    let _guard = crate::app_db::test_db_guard();
+    let fixture = converted_fixture("gemini");
+    let before = FileCheckpoint::capture(&fixture.dir).unwrap();
+    let record = load_record(&fixture.dir).unwrap();
+    let mut missing = record.clone();
+    missing.journals.clear();
+    save_record(&fixture.dir, &missing).unwrap();
+    assert!(ensure_shutdown_allowed().is_err());
+    assert!(begin_update_handoff().is_err());
+    assert!(!SHUTTING_DOWN.load(Ordering::Acquire));
+    assert!(shutdown_all().is_err());
+    assert!(!SHUTTING_DOWN.load(Ordering::Acquire));
+    assert!(lock_manager().unwrap().contains_key(&fixture.dir));
+    assert_eq!(
+        before.config,
+        FileCheckpoint::capture(&fixture.dir).unwrap().config
+    );
+    save_record(&fixture.dir, &record).unwrap();
+    let mut stale_settings = record.clone();
+    stale_settings.settings.takeover_enabled = false;
+    save_record(&fixture.dir, &stale_settings).unwrap();
+    let conn = crate::app_db::open().unwrap();
+    conn.execute_batch("CREATE TRIGGER reject_conversion_shutdown BEFORE UPDATE ON provider_failover BEGIN SELECT RAISE(ABORT,'fixture-conversion-shutdown-failure'); END;").unwrap();
+    let result = shutdown_all();
+    conn.execute_batch("DROP TRIGGER reject_conversion_shutdown")
+        .unwrap();
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("fixture-conversion-shutdown-failure"));
+    assert!(!SHUTTING_DOWN.load(Ordering::Acquire));
+    assert!(lock_manager().unwrap().contains_key(&fixture.dir));
+    let after = FileCheckpoint::capture(&fixture.dir).unwrap();
+    assert_eq!(before.config, after.config);
+    assert_eq!(before.auth, after.auth);
+    assert_eq!(before.selected, after.selected);
+    save_record(&fixture.dir, &record).unwrap();
+    with_provider_change(fixture.scope(), || Ok(())).unwrap();
+}
+
+#[test]
+fn converted_reattach_failure_restores_complete_files_selection_and_runtime() {
+    let _guard = crate::app_db::test_db_guard();
+    let mut fixture = Fixture::new();
+    fixture.providers[1].upstream_api = Some("anthropic_messages".into());
+    fixture.providers[1] =
+        crate::providers::save_provider_inner(fixture.providers[1].clone()).unwrap();
+    fixture.enable();
+    with_provider_change(fixture.scope(), || {
+        crate::providers::activate_saved_provider_inner(
+            fixture.scope(),
+            fixture.providers[1].id.clone(),
+        )
+    })
+    .unwrap();
+    let before = FileCheckpoint::capture(&fixture.dir).unwrap();
+    let result = with_provider_change(fixture.scope(), || {
+        fs::write(crate::config_path(&fixture.dir), "not valid = [toml").unwrap();
+        fs::write(
+            crate::auth_path(&fixture.dir),
+            r#"{"OPENAI_API_KEY":"replacement-fixture"}"#,
+        )
+        .unwrap();
+        Ok(())
+    });
+    assert!(result.unwrap_err().to_string().contains("恢复原配置"));
+    let after = FileCheckpoint::capture(&fixture.dir).unwrap();
+    assert_eq!(before.config, after.config);
+    assert_eq!(before.auth, after.auth);
+    assert_eq!(before.selected, after.selected);
+    assert_eq!(before.common_handled, after.common_handled);
+    let status = get_status(fixture.scope()).unwrap();
+    assert!(status.running && status.takeover_active);
+    assert_eq!(status.primary.unwrap().id, fixture.providers[1].id);
+}
+
+#[test]
+fn converted_route_restart_keeps_protocol_and_stale_recovery_never_restores_raw_url() {
+    let _guard = crate::app_db::test_db_guard();
+    let mut fixture = Fixture::new();
+    fixture.providers[1].upstream_api = Some("gemini".into());
+    fixture.providers[1] =
+        crate::providers::save_provider_inner(fixture.providers[1].clone()).unwrap();
+    let mut settings = fixture.settings();
+    settings.auto_failover_enabled = false;
+    save_settings(fixture.scope(), settings).unwrap();
+    with_provider_change(fixture.scope(), || {
+        crate::providers::activate_saved_provider_inner(
+            fixture.scope(),
+            fixture.providers[1].id.clone(),
+        )
+    })
+    .unwrap();
+    let original = fixture.text();
+    let runtime = lock_manager().unwrap().remove(&fixture.dir).unwrap();
+    runtime.proxy.shutdown();
+    assert!(recover_stale_route(fixture.scope())
+        .unwrap_err()
+        .to_string()
+        .contains("协议转换"));
+    assert_eq!(fixture.text(), original);
+    initialize().unwrap();
+    let status = get_status(fixture.scope()).unwrap();
+    assert!(status.running && status.takeover_active);
+    assert!(fixture.text().contains("127.0.0.1"));
+    assert_eq!(
+        lock_manager().unwrap().get(&fixture.dir).unwrap().routes[0].protocol,
+        UpstreamApi::Gemini
+    );
+}
+
+#[test]
+fn failover_to_converted_provider_preserves_close_guard() {
+    let _guard = crate::app_db::test_db_guard();
+    let mut fixture = Fixture::new();
+    fixture.providers[1].upstream_api = Some("gemini".into());
+    fixture.providers[1] =
+        crate::providers::save_provider_inner(fixture.providers[1].clone()).unwrap();
+    fixture.enable();
+    let mut runtimes = lock_manager().unwrap();
+    let runtime = runtimes.get(&fixture.dir).unwrap();
+    let notice = SelectionNotice {
+        dir: fixture.dir.clone(),
+        instance_id: runtime.instance_id,
+        token: runtime.token.clone(),
+        event: ProxySelectionEvent {
+            provider_id: fixture.providers[1].id.clone(),
+            revision: runtime.proxy.revision(),
+        },
+    };
+    record_selection(notice, &mut runtimes).unwrap();
+    assert!(
+        runtimes
+            .get(&fixture.dir)
+            .unwrap()
+            .journal
+            .as_ref()
+            .unwrap()
+            .requires_conversion
+    );
+    drop(runtimes);
+    let before = fixture.text();
+    let mut disabled = get_status(fixture.scope()).unwrap().settings;
+    disabled.takeover_enabled = false;
+    assert!(save_settings(fixture.scope(), disabled).is_err());
+    assert_eq!(fixture.text(), before);
 }
 
 #[test]

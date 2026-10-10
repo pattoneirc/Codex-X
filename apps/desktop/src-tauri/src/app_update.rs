@@ -6,7 +6,7 @@ use serde::Serialize;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 use tauri::{ipc::Channel, Manager, ResourceId, Webview};
@@ -17,7 +17,31 @@ use tauri_plugin_updater::Update;
 mod windows;
 
 static UPDATING: AtomicBool = AtomicBool::new(false);
+// 0: not installing, 1: installer preparation/write, 2: Windows handoff.
+static INSTALLATION_PHASE: AtomicU8 = AtomicU8::new(0);
 const DOWNLOAD_TIMEOUT_MS: u64 = 10 * 60 * 1000;
+
+struct InstallationExitGuard<'a>(&'a AtomicU8);
+impl<'a> InstallationExitGuard<'a> {
+    fn begin(phase: &'a AtomicU8) -> Self {
+        phase.store(1, Ordering::Release);
+        Self(phase)
+    }
+    #[cfg(any(test, target_os = "windows"))]
+    fn handed_off(self) {
+        self.0.store(2, Ordering::Release);
+        std::mem::forget(self);
+    }
+}
+impl Drop for InstallationExitGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(0, Ordering::Release);
+    }
+}
+
+pub(crate) fn defer_exit_during_installation() -> bool {
+    INSTALLATION_PHASE.load(Ordering::Acquire) == 1
+}
 
 #[derive(Clone, Serialize)]
 #[serde(tag = "event", content = "data")]
@@ -95,6 +119,24 @@ fn failure(stage: FailureStage, message: &str, log: Option<&UpdateLog>) -> Updat
     }
 }
 
+/// Check before changing the installed application on every platform. The
+/// converted supplier cannot resume through a raw Responses endpoint after exit.
+fn install_with_route_preflight<T>(
+    check: impl FnOnce() -> Result<(), ()>,
+    install: impl FnOnce() -> Result<T, UpdateFailure>,
+    log: &UpdateLog,
+) -> Result<T, UpdateFailure> {
+    if check().is_err() {
+        log.record("routing_recovery_preflight_failed");
+        return Err(failure(
+            FailureStage::Prepare,
+            "更新前未能确认连接配置可恢复，安装尚未开始。请检查路由配置后重试。",
+            Some(log),
+        ));
+    }
+    install()
+}
+
 /// This log contains only our fixed stage names and version, never URLs,
 /// headers, auth/config contents or raw network/parser error messages.
 struct UpdateLog {
@@ -140,6 +182,115 @@ fn timeout_ms(value: Option<u64>) -> u64 {
     value
         .unwrap_or(DOWNLOAD_TIMEOUT_MS)
         .clamp(30_000, DOWNLOAD_TIMEOUT_MS)
+}
+
+enum DownloadAttemptFailure {
+    Transport,
+    Verification,
+}
+
+async fn download_attempt(
+    update: &Update,
+    on_event: &Channel<AppUpdateEvent>,
+    log: &UpdateLog,
+) -> Result<Vec<u8>, DownloadAttemptFailure> {
+    let finished = AtomicBool::new(false);
+    let mut started = false;
+    update
+        .download(
+            |chunk_length, content_length| {
+                if !started {
+                    started = true;
+                    let _ = on_event.send(AppUpdateEvent::Started { content_length });
+                }
+                let _ = on_event.send(AppUpdateEvent::Progress { chunk_length });
+            },
+            || {
+                finished.store(true, Ordering::Release);
+                log.record("verifying_signature");
+                let _ = on_event.send(AppUpdateEvent::Verifying);
+            },
+        )
+        .await
+        .map_err(|_| {
+            if finished.load(Ordering::Acquire) {
+                DownloadAttemptFailure::Verification
+            } else {
+                DownloadAttemptFailure::Transport
+            }
+        })
+}
+
+async fn download_with_recovery(
+    update: &Update,
+    mut candidates: Vec<reqwest::Url>,
+    on_event: &Channel<AppUpdateEvent>,
+    log: &UpdateLog,
+) -> Result<Vec<u8>, UpdateFailure> {
+    match download_attempt(update, on_event, log).await {
+        Ok(bytes) => return Ok(bytes),
+        Err(DownloadAttemptFailure::Verification) => {
+            log.record("signature_verification_failed");
+            return Err(failure(
+                FailureStage::Verify,
+                "更新包校验未通过，未启动安装。请重新检查在线更新。",
+                Some(log),
+            ));
+        }
+        Err(DownloadAttemptFailure::Transport) => log.record("primary_download_transport_failed"),
+    }
+    if candidates.is_empty() {
+        match crate::app_update_channel::discover_download_candidates(update).await {
+            Ok(found) => candidates = found,
+            Err(_) => log.record("official_api_asset_lookup_failed"),
+        }
+    }
+    for candidate in candidates {
+        let alternate = match crate::app_update_channel::api_download_update(update, &candidate) {
+            Ok(alternate) => alternate,
+            Err(_) => continue,
+        };
+        log.record("retrying_download_via_official_api");
+        match download_attempt(&alternate, on_event, log).await {
+            Ok(bytes) => {
+                log.record("official_api_download_verified");
+                return Ok(bytes);
+            }
+            Err(DownloadAttemptFailure::Verification) => {
+                log.record("signature_verification_failed");
+                return Err(failure(
+                    FailureStage::Verify,
+                    "更新包校验未通过，未启动安装。请重新检查在线更新。",
+                    Some(log),
+                ));
+            }
+            Err(DownloadAttemptFailure::Transport) => {
+                log.record("official_api_download_transport_failed")
+            }
+        }
+    }
+    Err(failure(
+        FailureStage::Download,
+        "在线更新的主通道和官方备用通道均未能完成下载。请检查网络或代理后重试。",
+        Some(log),
+    ))
+}
+
+#[cfg(test)]
+pub(crate) async fn verify_download_recovery_for_test(
+    update: &Update,
+    candidates: Vec<reqwest::Url>,
+) -> Result<Vec<u8>, UpdateFailure> {
+    let temporary = tempfile::tempdir().expect("temporary updater test log");
+    let log = UpdateLog::create(temporary.path(), &update.version).expect("updater test log");
+    let channel = Channel::new(|_| Ok(()));
+    let bytes = download_with_recovery(update, candidates, &channel, &log).await?;
+    // Exercise the Windows staging handoff with verified fixture bytes only.
+    // Dropping this private temporary file never executes an installer.
+    let staged = windows::StagedInstaller::create(&bytes)
+        .expect("verified synthetic Windows packet stages successfully");
+    drop(staged);
+    Ok(bytes)
 }
 
 /// No installer is launched until all preparation succeeds. If launch fails,
@@ -201,18 +352,26 @@ pub(crate) async fn install_app_update(
     headers: Option<Vec<(String, String)>>,
 ) -> Result<InstallResult, UpdateFailure> {
     let _lease = UpdateLease::acquire(&UPDATING)?;
-    let update = webview
-        .resources_table()
-        .get::<Update>(update_rid)
-        .map_err(|_| {
-            failure(
-                FailureStage::Prepare,
-                "更新信息已失效，请重新检查更新。",
-                None,
-            )
-        })?;
-    let mut update = (*update).clone();
-    // The 15s metadata-check timeout must not become the package-download limit.
+    let (mut update, download_candidates) = if let Ok(owned) =
+        webview
+            .resources_table()
+            .get::<crate::app_update_channel::OwnedOnlineUpdate>(update_rid)
+    {
+        (owned.update.clone(), owned.download_candidates.clone())
+    } else {
+        let update = webview
+            .resources_table()
+            .get::<Update>(update_rid)
+            .map_err(|_| {
+                failure(
+                    FailureStage::Prepare,
+                    "更新信息已失效，请重新检查更新。",
+                    None,
+                )
+            })?;
+        ((*update).clone(), Vec::new())
+    };
+    // The metadata-check timeout must not become the package-download limit.
     update.timeout = Some(Duration::from_millis(timeout_ms(timeout)));
     if let Some(headers) = headers {
         update.headers.clear();
@@ -235,47 +394,14 @@ pub(crate) async fn install_app_update(
         )
     })?;
     log.record("download_started");
-    let finished = AtomicBool::new(false);
-    let mut started = false;
-    let bytes = update
-        .download(
-            |chunk_length, content_length| {
-                if !started {
-                    started = true;
-                    let _ = on_event.send(AppUpdateEvent::Started { content_length });
-                }
-                let _ = on_event.send(AppUpdateEvent::Progress { chunk_length });
-            },
-            || {
-                finished.store(true, Ordering::Release);
-                log.record("verifying_signature");
-                let _ = on_event.send(AppUpdateEvent::Verifying);
-            },
-        )
-        .await
-        .map_err(|_| {
-            if finished.load(Ordering::Acquire) {
-                log.record("signature_verification_failed");
-                failure(
-                    FailureStage::Verify,
-                    "更新包校验未通过，安装尚未启动。请重新下载或前往下载页。",
-                    Some(&log),
-                )
-            } else {
-                log.record("download_failed");
-                failure(
-                    FailureStage::Download,
-                    "更新下载未完成或连接超时。请检查网络后重试。",
-                    Some(&log),
-                )
-            }
-        })?;
+    let bytes = download_with_recovery(&update, download_candidates, &on_event, &log).await?;
     log.record("signature_verified");
+    let exit_guard = InstallationExitGuard::begin(&INSTALLATION_PHASE);
 
     #[cfg(target_os = "windows")]
     {
         let app = webview.app_handle().clone();
-        let result = install_windows(app, bytes, on_event, log).await;
+        let result = install_windows(app, bytes, on_event, log, exit_guard).await;
         if result.is_ok() {
             _lease.handoff();
         }
@@ -283,17 +409,33 @@ pub(crate) async fn install_app_update(
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = on_event.send(AppUpdateEvent::Installing);
-        log.record("install_started");
+        let _ = on_event.send(AppUpdateEvent::Preparing);
         tauri::async_runtime::spawn_blocking(move || {
-            update.install(bytes).map_err(|_| {
-                log.record("install_failed");
-                failure(
-                    FailureStage::Install,
-                    "安装更新未完成，请重试或前往下载页安装。",
-                    Some(&log),
-                )
-            })?;
+            let _exit_guard = exit_guard;
+            install_with_route_preflight(
+                || crate::failover::begin_update_handoff().map_err(|_| ()),
+                || {
+                    let _ = on_event.send(AppUpdateEvent::Installing);
+                    log.record("install_started");
+                    update.install(bytes).map_err(|_| {
+                        log.record("install_failed");
+                        if crate::failover::resume_after_failed_update().is_err() {
+                            log.record("routing_resume_failed");
+                        }
+                        failure(
+                            FailureStage::Install,
+                            "安装更新未完成，请重试或前往下载页安装。",
+                            Some(&log),
+                        )
+                    })
+                },
+                &log,
+            )?;
+            // The application bytes are already installed. A recovery warning
+            // must not turn this into an install retry or a second installer.
+            if crate::failover::resume_after_failed_update().is_err() {
+                log.record("routing_resume_failed_after_install_restart_required");
+            }
             log.record("install_finished_restart_required");
             Ok(InstallResult {
                 restart_required: true,
@@ -301,6 +443,7 @@ pub(crate) async fn install_app_update(
         })
         .await
         .map_err(|_| {
+            let _ = crate::failover::resume_after_failed_update();
             failure(
                 FailureStage::Install,
                 "安装更新未完成，请重新打开软件后检查更新。",
@@ -319,6 +462,7 @@ async fn install_windows(
     bytes: Vec<u8>,
     on_event: Channel<AppUpdateEvent>,
     log: UpdateLog,
+    exit_guard: InstallationExitGuard<'static>,
 ) -> Result<InstallResult, UpdateFailure> {
     tauri::async_runtime::spawn_blocking(move || {
         // Stage bytes before changing live routes. Only signed .exe payloads
@@ -332,20 +476,27 @@ async fn install_windows(
         })?;
         let _ = on_event.send(AppUpdateEvent::Preparing);
         log.record("preparing_route_shutdown");
-        prepared_install(
-            || crate::failover::shutdown_all().map_err(|_| ()),
+        install_with_route_preflight(
+            || crate::failover::ensure_shutdown_allowed().map_err(|_| ()),
             || {
-                let _ = on_event.send(AppUpdateEvent::Installing);
-                log.record("launching_installer");
-                installer.launch(std::process::id()).map_err(|_| ())
+                prepared_install(
+                    || crate::failover::shutdown_all().map_err(|_| ()),
+                    || {
+                        let _ = on_event.send(AppUpdateEvent::Installing);
+                        log.record("launching_installer");
+                        installer.launch(std::process::id()).map_err(|_| ())
+                    },
+                    || crate::failover::resume_after_failed_update().map_err(|_| ()),
+                    &log,
+                )
             },
-            || crate::failover::resume_after_failed_update().map_err(|_| ()),
             &log,
         )?;
         log.record("installer_handed_off");
         let _ = on_event.send(AppUpdateEvent::HandedOff);
         // Normal Tauri exit destroys windows/tray/single-instance lock. The
         // new installer waits for this PID before touching installed files.
+        exit_guard.handed_off();
         app.exit(0);
         Ok(InstallResult {
             restart_required: false,
@@ -365,6 +516,69 @@ async fn install_windows(
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[test]
+    fn installation_exit_guard_releases_on_failure_and_allows_windows_handoff() {
+        let phase = AtomicU8::new(0);
+        {
+            let _guard = InstallationExitGuard::begin(&phase);
+            assert_eq!(phase.load(Ordering::Acquire), 1);
+        }
+        assert_eq!(phase.load(Ordering::Acquire), 0);
+        InstallationExitGuard::begin(&phase).handed_off();
+        assert_eq!(phase.load(Ordering::Acquire), 2);
+        assert_ne!(phase.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn invalid_recovery_preflight_blocks_install_before_application_bytes_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = UpdateLog::create(temp.path(), "0.4.0").unwrap();
+        let app = temp.path().join("fixture-app");
+        fs::write(&app, b"original fixture").unwrap();
+        let error = install_with_route_preflight(
+            || Err(()),
+            || {
+                fs::write(&app, b"replacement fixture").unwrap();
+                Ok(())
+            },
+            &log,
+        )
+        .unwrap_err();
+        assert_eq!(error.stage, FailureStage::Prepare);
+        assert!(error.message.contains("可恢复"));
+        assert!(error.message.contains("安装尚未开始"));
+        assert_eq!(fs::read(&app).unwrap(), b"original fixture");
+        let stages = fs::read_to_string(&log.path).unwrap();
+        assert!(stages.contains("routing_recovery_preflight_failed"));
+        assert!(!stages.contains("install_started"));
+    }
+
+    #[test]
+    fn native_route_preflight_installs_once_and_preserves_installer_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = UpdateLog::create(temp.path(), "0.4.0").unwrap();
+        let calls = RefCell::new(vec![]);
+        let error = install_with_route_preflight(
+            || {
+                calls.borrow_mut().push("check");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("install");
+                Err::<(), _>(failure(
+                    FailureStage::Install,
+                    "fixture install error",
+                    Some(&log),
+                ))
+            },
+            &log,
+        )
+        .unwrap_err();
+        assert_eq!(*calls.borrow(), vec!["check", "install"]);
+        assert_eq!(error.stage, FailureStage::Install);
+        assert_eq!(error.message, "fixture install error");
+    }
 
     #[test]
     fn one_update_at_a_time_and_errors_release_the_guard() {

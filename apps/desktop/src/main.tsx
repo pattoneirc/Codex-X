@@ -1,3 +1,5 @@
+import { releaseInfoFromFallback, releaseInfoFromCheckFailure } from "./updateCheckFlow";
+import { providerUpstreamApi, providerRequiresConversion } from "./providerProtocol";
 import React from "react";
 import { flushSync } from "react-dom";
 import ReactDOM from "react-dom/client";
@@ -129,6 +131,7 @@ const defaultProviderForm: SavedProvider = {
   apiKey: "",
   tomlConfig: "",
   wireApi: "responses",
+  upstreamApi: "responses",
   requiresOpenaiAuth: false,
 };
 
@@ -140,6 +143,7 @@ const blankProviderForm: SavedProvider = {
   apiKey: "",
   tomlConfig: "",
   wireApi: "responses",
+  upstreamApi: "responses",
   requiresOpenaiAuth: false,
 };
 
@@ -568,7 +572,7 @@ function buildProviderTomlPreview(provider: SavedProvider) {
   const providerKey = "custom";
   const baseUrl = provider.baseUrl.trim().replace(/\/+$/, "");
   if (!model || !name || !baseUrl) return "";
-  const wireApi = provider.wireApi || "responses";
+  const wireApi = "responses";
   return [
     `model_provider = "${tomlEscape(providerKey)}"`,
     `model = "${tomlEscape(model)}"`,
@@ -1268,6 +1272,7 @@ function App() {
       modelDisplayName: local?.modelMappings?.find((mapping) => mapping.model === row.model)?.displayName,
       apiKey: row.apiKey,
       wireApi: row.wireApi,
+      upstreamApi: local?.upstreamApi || row.upstreamApi,
       requiresOpenaiAuth: row.requiresOpenaiAuth,
       isCurrent: row.isCurrent,
       isDefaultOfficial: row.isDefaultOfficial,
@@ -1910,13 +1915,17 @@ function App() {
     model: providerForm.model.trim(),
     apiKey: (providerForm.apiKey || "").trim(),
     tomlConfig: tomlConfig.trimEnd(),
-    wireApi: providerForm.wireApi || "responses",
+    wireApi: "responses",
+    upstreamApi: providerUpstreamApi(providerForm),
     requiresOpenaiAuth: providerForm.requiresOpenaiAuth,
   });
 
   const applyProviderConfig = (provider: SavedProvider) => {
     if (savedProviders.some((saved) => saved.id === provider.id)) {
       return invoke<ActionResult>("activate_saved_provider", { configDir: configDir || null, providerId: provider.id });
+    }
+    if (providerRequiresConversion(provider)) {
+      return Promise.reject(lang === "zh" ? "请先保存供应商，并在设置中开启本地路由和配置接管后启用。" : "Save this provider and enable the local router with config takeover in Settings before activating it.");
     }
     const tomlConfig = provider.tomlConfig?.trim();
     if (tomlConfig) {
@@ -2022,9 +2031,9 @@ function App() {
   const fetchProviderModels = async () => {
     const baseUrl = providerForm.baseUrl.trim();
     const apiKey = (providerForm.apiKey || "").trim();
-    if (!baseUrl || !apiKey) {
+    if (!baseUrl) {
       setError("");
-      setToast(lang === "zh" ? "请先填写 API 请求地址和 API Key" : "Enter the API URL and API key first");
+      setToast(lang === "zh" ? "请先填写 API 请求地址；认证可使用 API Key 或供应商 Headers" : "Enter the API URL first. Authentication can use an API key or provider headers");
       return;
     }
 
@@ -2034,7 +2043,7 @@ function App() {
     setError("");
     setToast(lang === "zh" ? "正在获取模型列表..." : "Fetching model list...");
     try {
-      const result = await invoke<ProviderModelsResult>("fetch_provider_models", { baseUrl, apiKey });
+      const result = await invoke<ProviderModelsResult>("fetch_provider_models", { baseUrl, apiKey, upstreamApi: providerUpstreamApi(providerForm), configText: providerTomlDraft });
       if (providerModelsRequestRef.current !== requestId) return;
       setAvailableProviderModels(result.models);
       setToast(result.models.length > 0
@@ -2049,13 +2058,13 @@ function App() {
     }
   };
 
-  const testProvider = async (id: string, baseUrl: string, apiKey?: string | null) => {
+  const testProvider = async (id: string, baseUrl: string, apiKey?: string | null, provider?: SavedProvider) => {
     const actionToken = beginActionBusy("testProvider");
     setProviderTestingId(id);
     setError("");
     setToast(lang === "zh" ? "正在检测连接..." : "Testing connection...");
     try {
-      const result = await invoke<ProviderConnectionResult>("test_provider_connection", { baseUrl, apiKey: apiKey || null });
+      const result = await invoke<ProviderConnectionResult>("test_provider_connection", { baseUrl, apiKey: apiKey || null, upstreamApi: provider ? providerUpstreamApi(provider) : "responses", configText: provider?.tomlConfig || null });
       if (result.ok) {
         setToast(lang === "zh" ? `连接成功，响应延迟 ${result.durationMs}ms` : `Connected, ${result.durationMs}ms latency`);
       } else {
@@ -2179,9 +2188,11 @@ function App() {
 
   const checkForUpdates = React.useCallback(async ({ quiet = false }: { quiet?: boolean } = {}) => {
     setReleaseInfo({ status: "checking" });
+    let nativeCheckAttempted = false;
     try {
       if (aboutInfo?.nativeUpdaterSupported !== false) {
-        const updaterResult = await appUpdater.check({ force: !quiet, timeout: 15_000 });
+        nativeCheckAttempted = true;
+        const updaterResult = await appUpdater.check({ force: !quiet, timeout: 30_000 });
         if (updaterResult === "available") {
           const snapshot = appUpdater.getSnapshot();
           const latestVersion = snapshot.latestVersion || "";
@@ -2207,25 +2218,27 @@ function App() {
             latestVersion: aboutInfo?.appVersion,
             htmlUrl: `https://github.com/${FALLBACK_GITHUB_REPO}/releases/latest`,
             hasUpdate: false,
+            updateMethod: "native",
           });
           if (!quiet) setToast(lang === "zh" ? "当前已是最新版本" : "You are up to date");
           return;
         }
       }
 
-      // Keep the existing lightweight release check as a manual-download fallback for
-      // bootstrap and portable builds that cannot use the native updater yet.
+      // Metadata is useful even when the native channel is unavailable. It
+      // cannot supply an updater RID or replace the signed installation check.
       const update = await invoke<AppUpdateInfo>("check_app_update");
-      const message = update.hasUpdate
-        ? (lang === "zh" ? "发现新版本" : "Update available")
-        : (lang === "zh" ? "当前已是最新版本" : "You are up to date");
-      setReleaseInfo({
-        status: "ok",
-        latestVersion: update.latestVersion,
-        htmlUrl: update.htmlUrl,
-        hasUpdate: update.hasUpdate,
-        updateMethod: update.hasUpdate ? "download" : undefined,
-      });
+      setReleaseInfo(releaseInfoFromFallback(update, nativeCheckAttempted));
+      if (nativeCheckAttempted) {
+        if (quiet && update.hasUpdate) {
+          setToast(lang === "zh"
+            ? `发现新版本 ${update.latestVersion}，但在线更新检查失败，可重新检查`
+            : `Version ${update.latestVersion} is available, but the in-app update check failed. Retry the check`);
+        } else if (!quiet) {
+          setUpdatePromptOpen(true);
+        }
+        return;
+      }
       if (update.hasUpdate) {
         if (quiet) {
           setToast(lang === "zh" ? `发现新版本 ${update.latestVersion}，可在概览页查看` : `New version ${update.latestVersion} is available`);
@@ -2233,14 +2246,15 @@ function App() {
           setUpdatePromptOpen(true);
         }
       } else if (!quiet) {
-        setToast(message);
+        setToast(lang === "zh" ? "当前已是最新版本" : "You are up to date");
       }
     } catch {
-      const message = quiet ? (lang === "zh" ? "自动检查失败" : "Auto check failed") : (lang === "zh" ? "检查失败" : "Check failed");
-      setReleaseInfo({
-        status: "error",
-      });
-      if (!quiet) setToast(message);
+      setReleaseInfo(releaseInfoFromCheckFailure(nativeCheckAttempted));
+      if (!quiet && nativeCheckAttempted) {
+        setUpdatePromptOpen(true);
+      } else if (!quiet) {
+        setToast(lang === "zh" ? "检查失败" : "Check failed");
+      }
     }
   }, [aboutInfo?.appVersion, aboutInfo?.nativeUpdaterSupported, lang]);
 
@@ -2649,7 +2663,8 @@ function App() {
   const newCustomProviderForm = (configText = providerCreationBase): SavedProvider => ({
     ...blankProviderForm,
     model: state?.model?.trim() || blankProviderForm.model,
-    wireApi: currentProvider?.wireApi?.trim() || blankProviderForm.wireApi,
+    wireApi: "responses",
+    upstreamApi: providerUpstreamApi(currentProvider || blankProviderForm),
     requiresOpenaiAuth: currentProvider?.requiresOpenaiAuth ?? blankProviderForm.requiresOpenaiAuth,
     tomlConfig: configText.trim(),
   });
@@ -2771,7 +2786,8 @@ function App() {
       model: provider.model,
       apiKey: provider.apiKey || "",
       tomlConfig: state?.configText?.trim() || "",
-      wireApi: provider.wireApi || "responses",
+      wireApi: "responses",
+      upstreamApi: providerUpstreamApi(provider),
       requiresOpenaiAuth: provider.requiresOpenaiAuth,
     };
     setProviderForm(next);
@@ -3033,7 +3049,10 @@ function App() {
         latestVersion={releaseInfo.latestVersion}
         onClose={() => setUpdatePromptOpen(false)}
         onUpdate={releaseInfo.updateMethod === "native" ? updater.downloadAndInstall : undefined}
-        onRetry={releaseInfo.updateMethod === "native" ? updater.retry : undefined}
+        onRetry={releaseInfo.updateMethod === "native" ? async () => {
+          if (updater.state.failure === "check") await checkForUpdates();
+          else await updater.retry();
+        } : undefined}
         onRestart={releaseInfo.updateMethod === "native" ? updater.restart : undefined}
         onDownload={() => {
           setUpdatePromptOpen(false);
@@ -3129,7 +3148,8 @@ function App() {
                   baseUrl: providerForm.baseUrl,
                   providerName: providerForm.providerName,
                   model: providerForm.model,
-                  wireApi: providerForm.wireApi,
+                  wireApi: "responses",
+                  upstreamApi: providerUpstreamApi(providerForm),
                   requiresOpenaiAuth: providerForm.requiresOpenaiAuth,
                 }}
                 officialForm={officialForm}
@@ -3170,7 +3190,7 @@ function App() {
                 }}
                 onTestProvider={(row) => {
                   const local = findLocalProviderForRow(row);
-                  void testProvider(row.testingKey || `${row.source}-${row.id}`, row.baseUrl, local?.apiKey || row.apiKey || null);
+                  void testProvider(row.testingKey || `${row.source}-${row.id}`, row.baseUrl, local?.apiKey || row.apiKey || null, local);
                 }}
                 onEditProvider={(row) => {
                   if (row.source === "official") {
@@ -3226,7 +3246,10 @@ function App() {
                 }))}
                 onProviderModelChange={(value) => setProviderForm((current) => ({ ...current, model: value }))}
                 onFetchModels={() => void fetchProviderModels()}
-                onWireApiChange={(value) => setProviderForm((current) => ({ ...current, wireApi: value }))}
+                onUpstreamApiChange={(value) => {
+                  resetAvailableProviderModels();
+                  setProviderForm((current) => ({ ...current, upstreamApi: value, wireApi: "responses" }));
+                }}
                 onRequiresAuthChange={(value) => setProviderForm((current) => ({ ...current, requiresOpenaiAuth: value }))}
                 onToggleApiKeyVisibility={() => setProviderApiKeyVisible((value) => !value)}
                 onProviderTomlDraftChange={(value, origin = "manual") => {
@@ -3234,6 +3257,11 @@ function App() {
                   setProviderTomlDraft(value);
                   setProviderTomlDirty(true);
                   if (origin === "manual") setProviderCommonConfigDirty(true);
+                }}
+                onProviderHeadersConfigChange={(value) => {
+                  providerDraftRequestRef.current += 1;
+                  setProviderTomlDraft(value);
+                  setProviderForm((current) => ({ ...current, tomlConfig: value }));
                 }}
                 onResetProviderToml={() => {
                   providerDraftRequestRef.current += 1;

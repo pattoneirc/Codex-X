@@ -1,0 +1,9 @@
+{
+  "testOnly": true,
+  "fixturePurpose": "Synthetic fixture for cfg(test) Tauri SDK download and Minisign verification. The 256-byte PE header contains no executable code, sections or entry point. Never install or run it. This public key must never replace the production updater public key. Its private key was generated only in memory and was not saved.",
+  "expectedVersion": "0.3.24",
+  "publicKeyBase64": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDMxOUI5MzI2MzA2QkQ5NUMKUldSYzJXc3dKcE9iTWZrYjhWL1VCZXZ0TWFBNE9IWE9zTENncU5LSFFKaW9wblF4c3VtQXVSSVMK",
+  "signatureBase64": "dW50cnVzdGVkIGNvbW1lbnQ6IHN5bnRoZXRpYyB0ZXN0IHNpZ25hdHVyZTsgbmV2ZXIgdXNlIGZvciBwcm9kdWN0aW9uIHVwZGF0ZXMKUlVSYzJXc3dKcE9iTWRZZ0xROVZ0T3c1SXVuWXYvU3FUbkRrNGowMjNId2FhcnhTeFpIa25DUm80bGdINzd4UEYvcE1mRWxKUHJZeVczQzBiNHlwWjJYZ3Mxcm0yNVJaYmdBPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxNTA0MDAwCWZpbGU6b25saW5lLXVwZGF0ZS1maXh0dXJlLmV4ZQoxYWxWSVlaWHdYcHlib01YcjdRS1V3RlR4d3FvVFhqMERJWlBGVGR1Z1hyYnZKTFByR1RwaFJjTnRWRGM4d2tLUEsxV01Lcmk5dy9sSzMyVEg0dWRBZz09Cg==",
+  "payloadBase64": "TVoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAFBFAABkhgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQ29kZXgtWCBzeW50aGV0aWMgdXBkYXRlciBmaXh0dXJlOiBubyBzZWN0aW9ucywgbm8gZW50cnkgcG9pbnQsIG5vIGV4ZWN1dGFibGUgY29kZS4gTmV2ZXIgaW5zdGFsbC4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+  "sha256": "7764dacacade2426d04ec977eb28b25ed31f8e272c096c1a9d1e9873d0e49be4"
+}

@@ -5,7 +5,170 @@ use crate::{now_rfc3339, resolve_codex_dir, sanitize_id};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use toml_edit::{value, DocumentMut};
+use toml_edit::{value, DocumentMut, Item, Table};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum ProviderHeaderSource {
+    Static,
+    Env,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ProviderHeader {
+    pub(crate) name: String,
+    pub(crate) value: String,
+    pub(crate) source: ProviderHeaderSource,
+}
+
+fn provider_headers_from_table(table: &Table) -> Result<Vec<ProviderHeader>> {
+    let mut result = Vec::new();
+    for (field, source) in [
+        ("http_headers", ProviderHeaderSource::Static),
+        ("env_http_headers", ProviderHeaderSource::Env),
+    ] {
+        let Some(item) = table.get(field) else {
+            continue;
+        };
+        let headers = item
+            .as_table_like()
+            .ok_or_else(|| CodexxError::Config(format!("供应商 {field} 必须是键值表")))?;
+        for (name, item) in headers.iter() {
+            let text = item
+                .as_str()
+                .ok_or_else(|| CodexxError::Config(format!("供应商 {field} 的值必须是文本")))?;
+            result.push(ProviderHeader {
+                name: name.to_string(),
+                value: text.to_string(),
+                source,
+            });
+        }
+    }
+    Ok(result)
+}
+
+fn validate_provider_headers(headers: &[ProviderHeader]) -> Result<()> {
+    let mut names = HashSet::new();
+    for (index, header) in headers.iter().enumerate() {
+        let row = index + 1;
+        reqwest::header::HeaderName::from_bytes(header.name.as_bytes())
+            .map_err(|_| CodexxError::Config(format!("第 {row} 个供应商 Header 名称无效")))?;
+        if !names.insert(header.name.to_ascii_lowercase()) {
+            return Err(CodexxError::Config(format!(
+                "第 {row} 个供应商 Header 名称重复（不区分大小写）"
+            )));
+        }
+        match header.source {
+            ProviderHeaderSource::Static => {
+                reqwest::header::HeaderValue::from_str(&header.value).map_err(|_| {
+                    CodexxError::Config(format!(
+                        "第 {row} 个供应商 Header ({}) 值无效，不能包含换行或控制字符",
+                        header.name
+                    ))
+                })?;
+            }
+            ProviderHeaderSource::Env => {
+                let mut bytes = header.value.bytes();
+                let valid_first = bytes
+                    .next()
+                    .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_');
+                if !valid_first || !bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_') {
+                    return Err(CodexxError::Config(format!(
+                        "第 {row} 个供应商 Header ({}) 环境变量名无效，请使用字母、数字和下划线，且不要以数字开头", header.name
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn validate_provider_header_table(table: &Table) -> Result<()> {
+    validate_provider_headers(&provider_headers_from_table(table)?)
+}
+
+fn selected_provider_id(doc: &DocumentMut) -> Result<String> {
+    doc.get("model_provider")
+        .and_then(Item::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(ToString::to_string)
+        .ok_or_else(|| CodexxError::Config("供应商 TOML 缺少 model_provider".to_string()))
+}
+
+/// Read only the selected provider's headers. Invalid names and values remain
+/// visible to the editor so users can repair older configurations.
+pub(crate) fn read_provider_headers_inner(config_text: String) -> Result<Vec<ProviderHeader>> {
+    let doc = config_text
+        .parse::<DocumentMut>()
+        .map_err(|_| CodexxError::Config("供应商 TOML 无效，请先修正配置".to_string()))?;
+    let provider_id = selected_provider_id(&doc)?;
+    let table = doc
+        .get("model_providers")
+        .and_then(Item::as_table)
+        .and_then(|providers| providers.get(&provider_id))
+        .and_then(Item::as_table)
+        .ok_or_else(|| CodexxError::Config("供应商 TOML 缺少当前供应商配置表".to_string()))?;
+    provider_headers_from_table(table)
+}
+
+/// Patch Codex's native TOML fields without changing credentials or unrelated
+/// provider/shared configuration. An empty list removes both header fields.
+pub(crate) fn update_provider_headers_inner(
+    config_text: String,
+    mut headers: Vec<ProviderHeader>,
+) -> Result<String> {
+    for header in &mut headers {
+        header.name = header.name.trim().to_string();
+    }
+    validate_provider_headers(&headers)?;
+    let mut doc = config_text
+        .parse::<DocumentMut>()
+        .map_err(|_| CodexxError::Config("供应商 TOML 无效，请先修正配置".to_string()))?;
+    let provider_id = selected_provider_id(&doc)?;
+    let table = doc
+        .get_mut("model_providers")
+        .and_then(Item::as_table_mut)
+        .and_then(|providers| providers.get_mut(&provider_id))
+        .and_then(Item::as_table_mut)
+        .ok_or_else(|| CodexxError::Config("供应商 TOML 缺少当前供应商配置表".to_string()))?;
+    for (field, source) in [
+        ("http_headers", ProviderHeaderSource::Static),
+        ("env_http_headers", ProviderHeaderSource::Env),
+    ] {
+        let rows = headers
+            .iter()
+            .filter(|header| header.source == source)
+            .collect::<Vec<_>>();
+        if rows.is_empty() {
+            table.remove(field);
+            continue;
+        }
+        // Retain table style, comments and ordering for existing header names.
+        if table.get(field).and_then(Item::as_table_like).is_none() {
+            table.insert(field, Item::Table(Table::new()));
+        }
+        let values = table
+            .get_mut(field)
+            .and_then(Item::as_table_like_mut)
+            .unwrap();
+        let removed = values
+            .iter()
+            .filter(|(name, _)| !rows.iter().any(|header| header.name == *name))
+            .map(|(name, _)| name.to_string())
+            .collect::<Vec<_>>();
+        for name in removed {
+            values.remove(&name);
+        }
+        for header in rows {
+            if values.get(&header.name).and_then(Item::as_str) != Some(header.value.as_str()) {
+                values.insert(&header.name, value(header.value.clone()));
+            }
+        }
+    }
+    Ok(doc.to_string().trim_end().to_string())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -17,6 +180,9 @@ pub(crate) struct SavedProvider {
     pub(crate) api_key: Option<String>,
     pub(crate) toml_config: Option<String>,
     pub(crate) wire_api: String,
+    /// Upstream format used by the app's local bridge; Codex still speaks Responses.
+    #[serde(default)]
+    pub(crate) upstream_api: Option<String>,
     pub(crate) requires_openai_auth: bool,
     #[serde(default)]
     pub(crate) model_mappings: Vec<super::model_catalog::ProviderModelMapping>,
@@ -182,17 +348,15 @@ pub(crate) fn provider_template_from_document(
     provider_id: &str,
     model: &str,
 ) -> Result<String> {
-    let provider_exists = doc
+    let provider_table = doc
         .get("model_providers")
         .and_then(|item| item.as_table())
         .and_then(|providers| providers.get(provider_id))
         .and_then(|item| item.as_table())
-        .is_some();
-    if !provider_exists {
-        return Err(CodexxError::Config(format!(
-            "供应商 TOML 缺少 [model_providers.{provider_id}]"
-        )));
-    }
+        .ok_or_else(|| {
+            CodexxError::Config(format!("供应商 TOML 缺少 [model_providers.{provider_id}]"))
+        })?;
+    validate_provider_header_table(provider_table)?;
 
     let mut template = doc.clone();
     template["model_provider"] = value(provider_id);
@@ -359,6 +523,7 @@ fn saved_provider_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SavedPro
         api_key: row.get(4)?,
         toml_config: row.get(5)?,
         wire_api: row.get(6)?,
+        upstream_api: row.get(9)?,
         requires_openai_auth: row.get::<_, i64>(7)? != 0,
         model_mappings: serde_json::from_str(&row.get::<_, String>(8)?).map_err(|error| {
             rusqlite::Error::FromSqlConversionFailure(
@@ -374,7 +539,7 @@ fn stored_providers_on_connection(conn: &Connection) -> Result<Vec<StoredProvide
     let mut stmt = conn
         .prepare(
             "SELECT id, provider_name, base_url, model, api_key, toml_config, wire_api,
-                    requires_openai_auth, model_mappings_json, created_at, updated_at, source, source_id
+                    requires_openai_auth, model_mappings_json, upstream_api, created_at, updated_at, source, source_id
              FROM providers
              ORDER BY created_at ASC, rowid ASC",
         )
@@ -383,10 +548,10 @@ fn stored_providers_on_connection(conn: &Connection) -> Result<Vec<StoredProvide
         .query_map([], |row| {
             Ok(StoredProvider {
                 provider: saved_provider_from_row(row)?,
-                created_at: row.get(9)?,
-                updated_at: row.get(10)?,
-                source: row.get(11)?,
-                source_id: row.get(12)?,
+                created_at: row.get(10)?,
+                updated_at: row.get(11)?,
+                source: row.get(12)?,
+                source_id: row.get(13)?,
             })
         })
         .map_err(|e| CodexxError::Database(e.to_string()))?;
@@ -507,7 +672,7 @@ pub(crate) fn provider_by_id_on_connection(
     let mut stmt = conn
         .prepare(
             "SELECT id, provider_name, base_url, model, api_key, toml_config, wire_api,
-                    requires_openai_auth, model_mappings_json
+                    requires_openai_auth, model_mappings_json, upstream_api
              FROM providers WHERE id = ?1 LIMIT 1",
         )
         .map_err(|e| CodexxError::Database(e.to_string()))?;
@@ -542,8 +707,8 @@ fn write_provider_with_origin(
     conn.execute(
         "INSERT INTO providers
             (id, provider_name, base_url, model, api_key, toml_config, wire_api,
-             requires_openai_auth, model_mappings_json, source, source_id, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)
+             requires_openai_auth, model_mappings_json, upstream_api, source, source_id, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13)
          ON CONFLICT(id) DO UPDATE SET
             provider_name = excluded.provider_name,
             base_url = excluded.base_url,
@@ -553,6 +718,7 @@ fn write_provider_with_origin(
             wire_api = excluded.wire_api,
             requires_openai_auth = excluded.requires_openai_auth,
             model_mappings_json = excluded.model_mappings_json,
+            upstream_api = excluded.upstream_api,
             source = CASE
                 WHEN excluded.source_id IS NULL THEN providers.source
                 ELSE excluded.source
@@ -572,6 +738,7 @@ fn write_provider_with_origin(
             provider.wire_api,
             if provider.requires_openai_auth { 1 } else { 0 },
             model_mappings_json,
+            provider.upstream_api,
             source,
             source_id,
             now,
@@ -633,6 +800,11 @@ fn merge_authoritative_import(
     }
     if incoming.model_mappings.is_empty() {
         incoming.model_mappings = existing.model_mappings.clone();
+    }
+    // CC Switch can refresh native TOML without knowing the local bridge's
+    // format selection. Keep the app metadata unless the import supplies one.
+    if incoming.upstream_api.is_none() {
+        incoming.upstream_api = existing.upstream_api.clone();
     }
     incoming
 }
@@ -838,6 +1010,59 @@ fn normalize_stored_provider_from_toml(provider: &mut SavedProvider) {
     // TOML template. Reads must trust a valid template without making one bad
     // legacy row prevent the provider list from loading.
     let _ = apply_provider_toml_authority(provider);
+    if normalize_provider_upstream_api(provider).is_ok() && provider.upstream_api.is_some() {
+        // Migrate legacy native Chat templates in memory, preserving comments
+        // and the independent bridge format instead of putting metadata in TOML.
+        if let Some(mut doc) = provider
+            .toml_config
+            .as_deref()
+            .and_then(|text| text.parse::<DocumentMut>().ok())
+        {
+            if let Ok(id) = selected_provider_id(&doc) {
+                if let Some(table) = doc
+                    .get_mut("model_providers")
+                    .and_then(Item::as_table_mut)
+                    .and_then(|providers| providers.get_mut(&id))
+                    .and_then(Item::as_table_mut)
+                {
+                    if table.get("wire_api").and_then(Item::as_str) != Some("responses") {
+                        table["wire_api"] = value("responses");
+                    }
+                    provider.toml_config = Some(doc.to_string().trim_end().to_string());
+                }
+            }
+        }
+    }
+}
+
+fn normalize_provider_upstream_api(provider: &mut SavedProvider) -> Result<()> {
+    if !matches!(
+        provider.wire_api.trim(),
+        "" | "responses" | "chat" | "chat_completions"
+    ) {
+        return Err(CodexxError::Config(
+            "供应商 wire_api 不受支持；Codex 客户端仅支持 Responses，请通过上游协议选择 Chat Completions、Anthropic Messages 或 Gemini".to_string(),
+        ));
+    }
+    let selected = provider.upstream_api.as_deref().map(str::trim);
+    provider.upstream_api =
+        match selected {
+            Some("responses" | "chat_completions" | "anthropic_messages" | "gemini") => {
+                selected.map(ToString::to_string)
+            }
+            Some(_) => return Err(CodexxError::Config(
+                "供应商上游协议必须是 responses、chat_completions、anthropic_messages 或 gemini"
+                    .to_string(),
+            )),
+            None if matches!(provider.wire_api.trim(), "chat" | "chat_completions") => {
+                Some("chat_completions".to_string())
+            }
+            None => None,
+        };
+    if provider.upstream_api.is_some() {
+        provider.wire_api = "responses".to_string();
+    }
+    Ok(())
 }
 
 fn sync_provider_toml_from_fields(provider: &mut SavedProvider) -> Result<()> {
@@ -907,6 +1132,7 @@ pub(crate) fn normalize_saved_provider(provider: SavedProvider) -> Result<SavedP
         } else {
             provider.wire_api.trim().to_string()
         },
+        upstream_api: provider.upstream_api,
         requires_openai_auth: provider.requires_openai_auth,
         model_mappings,
     };
@@ -928,17 +1154,28 @@ pub(crate) fn normalize_saved_provider(provider: SavedProvider) -> Result<SavedP
     // reach this path. For an explicit user edit, the latest form fields win
     // while the full TOML (comments, MCP, projects, desktop settings, etc.) is
     // retained verbatim apart from the standard provider fields.
+    normalize_provider_upstream_api(&mut normalized)?;
     sync_provider_toml_from_fields(&mut normalized)?;
     Ok(normalized)
 }
 
 pub(crate) fn normalize_saved_provider_for_save(
     conn: &Connection,
-    provider: SavedProvider,
+    mut provider: SavedProvider,
 ) -> Result<SavedProvider> {
     let requested_id = provider.id.trim().to_string();
+    let existing = provider_by_id_on_connection(conn, &requested_id)?;
+    if provider.upstream_api.is_none()
+        && !matches!(provider.wire_api.trim(), "chat" | "chat_completions")
+    {
+        // Older clients omit this new app-only field. Preserve their existing
+        // route format; selecting native Responses explicitly uses Some(responses).
+        provider.upstream_api = existing
+            .as_ref()
+            .and_then(|saved| saved.upstream_api.clone());
+    }
     let mut normalized = normalize_saved_provider(provider)?;
-    if provider_by_id_on_connection(conn, &requested_id)?.is_some() {
+    if existing.is_some() {
         // Existing IDs are record identities. Preserve legacy reserved IDs such
         // as `custom` instead of treating an edit as a new normalized record.
         normalized.id = requested_id;
@@ -1021,6 +1258,7 @@ fn duplicate_provider_on_connection(
             if let Some(original) = saved.iter().find(|provider| &provider.id == saved_id) {
                 detected.id = original.id.clone();
                 detected.model_mappings = original.model_mappings.clone();
+                detected.upstream_api = original.upstream_api.clone();
                 if detected.api_key.is_none() {
                     detected.api_key = original.api_key.clone();
                 }
@@ -1112,6 +1350,7 @@ pub(crate) fn save_detected_provider_with_rollback_inner(
         [saved_id] => {
             if let Some(saved) = saved.iter().find(|provider| &provider.id == saved_id) {
                 live.model_mappings = saved.model_mappings.clone();
+                live.upstream_api = saved.upstream_api.clone();
             }
             if live.api_key.is_none() {
                 live.api_key = saved
@@ -1148,8 +1387,8 @@ fn insert_stored_provider(conn: &Connection, stored: &StoredProvider) -> Result<
     conn.execute(
         "INSERT INTO providers
             (id, provider_name, base_url, model, api_key, toml_config, wire_api,
-             requires_openai_auth, model_mappings_json, source, source_id, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+             requires_openai_auth, model_mappings_json, upstream_api, source, source_id, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             provider.id,
             provider.provider_name,
@@ -1160,6 +1399,7 @@ fn insert_stored_provider(conn: &Connection, stored: &StoredProvider) -> Result<
             provider.wire_api,
             if provider.requires_openai_auth { 1 } else { 0 },
             model_mappings_json,
+            provider.upstream_api,
             stored.source,
             stored.source_id,
             stored.created_at,
@@ -1283,6 +1523,155 @@ pub(crate) fn experimental_bearer_token_from_doc(
 mod tests {
     use super::*;
 
+    const HEADER_CONFIG: &str = r#"# keep the shared configuration
+model_provider = "custom"
+model = "gpt-test"
+
+[model_providers.custom]
+name = "Header provider"
+base_url = "https://header.example.test/v1"
+wire_api = "responses"
+http_headers = { "X-Title" = "Codex-X" }
+env_http_headers = { "X-Project" = "PROJECT_ID" }
+
+[model_providers.other.http_headers]
+X-Other = "keep-other-provider"
+
+[mcp_servers.keep]
+command = "fixture-server"
+"#;
+
+    fn header(name: &str, text: &str, source: ProviderHeaderSource) -> ProviderHeader {
+        ProviderHeader {
+            name: name.to_string(),
+            value: text.to_string(),
+            source,
+        }
+    }
+
+    #[test]
+    fn headers_read_patch_and_remove_only_touch_the_selected_provider() {
+        let rows = read_provider_headers_inner(HEADER_CONFIG.to_string()).unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                header("X-Title", "Codex-X", ProviderHeaderSource::Static),
+                header("X-Project", "PROJECT_ID", ProviderHeaderSource::Env),
+            ]
+        );
+        let next = update_provider_headers_inner(
+            HEADER_CONFIG.to_string(),
+            vec![
+                header(
+                    " User-Agent ",
+                    "  custom agent  ",
+                    ProviderHeaderSource::Static,
+                ),
+                header("X-Project", "PROJECT_ID", ProviderHeaderSource::Env),
+            ],
+        )
+        .unwrap();
+        let doc = next.parse::<DocumentMut>().unwrap();
+        assert!(next.contains("# keep the shared configuration"));
+        assert_eq!(
+            doc["mcp_servers"]["keep"]["command"].as_str(),
+            Some("fixture-server")
+        );
+        assert_eq!(
+            doc["model_providers"]["other"]["http_headers"]["X-Other"].as_str(),
+            Some("keep-other-provider")
+        );
+        assert_eq!(
+            doc["model_providers"]["custom"]["http_headers"]["User-Agent"].as_str(),
+            Some("  custom agent  ")
+        );
+        assert!(doc["model_providers"]["custom"]["http_headers"]
+            .as_table_like()
+            .unwrap()
+            .get("X-Title")
+            .is_none());
+        let removed = update_provider_headers_inner(next, Vec::new()).unwrap();
+        assert!(read_provider_headers_inner(removed.clone())
+            .unwrap()
+            .is_empty());
+        let removed = removed.parse::<DocumentMut>().unwrap();
+        assert!(removed["model_providers"]["custom"]
+            .as_table()
+            .unwrap()
+            .get("http_headers")
+            .is_none());
+        assert!(removed["model_providers"]["custom"]
+            .as_table()
+            .unwrap()
+            .get("env_http_headers")
+            .is_none());
+    }
+
+    #[test]
+    fn headers_patch_accepts_table_syntax_and_preserves_unchanged_comments() {
+        let text = HEADER_CONFIG.replace("http_headers = { \"X-Title\" = \"Codex-X\" }\nenv_http_headers = { \"X-Project\" = \"PROJECT_ID\" }", "[model_providers.custom.http_headers]\n# keep header comment\nX-Title = \"Codex-X\" # keep value comment\n[model_providers.custom.env_http_headers]\nX-Project = \"PROJECT_ID\"");
+        let rows = read_provider_headers_inner(text.clone()).unwrap();
+        let patched = update_provider_headers_inner(text.clone(), rows).unwrap();
+        assert_eq!(patched, text.trim_end());
+    }
+
+    #[test]
+    fn headers_reject_duplicate_names_and_injection_without_echoing_values() {
+        for rows in [
+            vec![
+                header("X-Test", "secret", ProviderHeaderSource::Static),
+                header("x-test", "PROJECT_ID", ProviderHeaderSource::Env),
+            ],
+            vec![header("bad:name", "secret", ProviderHeaderSource::Static)],
+            vec![header(
+                "X-Test",
+                "secret\r\nInjected: yes",
+                ProviderHeaderSource::Static,
+            )],
+            vec![header("X-Test", "secret\0", ProviderHeaderSource::Static)],
+            vec![header(
+                "X-Test",
+                "PROJECT=secret",
+                ProviderHeaderSource::Env,
+            )],
+        ] {
+            let error = update_provider_headers_inner(HEADER_CONFIG.to_string(), rows)
+                .unwrap_err()
+                .to_string();
+            assert!(!error.contains("secret"));
+            assert!(error.contains("供应商 Header"));
+        }
+    }
+
+    #[test]
+    fn invalid_legacy_headers_can_be_read_and_repaired_but_cannot_be_saved() {
+        let text = HEADER_CONFIG.replace("\"Codex-X\"", "\"secret\\r\\ninjection\"");
+        let rows = read_provider_headers_inner(text.clone()).unwrap();
+        assert_eq!(rows[0].value, "secret\r\ninjection");
+        let doc = text.parse::<DocumentMut>().unwrap();
+        assert!(provider_template_from_document(&doc, "custom", "gpt-test").is_err());
+        let repaired = update_provider_headers_inner(
+            text,
+            vec![header("X-Title", "safe", ProviderHeaderSource::Static)],
+        )
+        .unwrap();
+        assert!(provider_template_from_document(
+            &repaired.parse::<DocumentMut>().unwrap(),
+            "custom",
+            "gpt-test"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn headers_reject_malformed_tables_and_non_text_values() {
+        for replacement in ["http_headers = 4", "http_headers = { X-Test = 4 }"] {
+            let text =
+                HEADER_CONFIG.replace("http_headers = { \"X-Title\" = \"Codex-X\" }", replacement);
+            assert!(read_provider_headers_inner(text).is_err());
+        }
+    }
+
     fn test_connection() -> Connection {
         let conn = Connection::open_in_memory().expect("open provider test database");
         conn.execute_batch(
@@ -1292,6 +1681,7 @@ mod tests {
                 wire_api TEXT NOT NULL DEFAULT 'responses',
                 requires_openai_auth INTEGER NOT NULL DEFAULT 1,
                 model_mappings_json TEXT NOT NULL DEFAULT '[]',
+                upstream_api TEXT,
                 source TEXT NOT NULL DEFAULT 'manual',
                 source_id TEXT,
                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL);",
@@ -1310,8 +1700,167 @@ mod tests {
             toml_config: None,
             wire_api: "responses".to_string(),
             requires_openai_auth: true,
+            upstream_api: None,
             model_mappings: Vec::new(),
         }
+    }
+
+    #[test]
+    fn bridge_protocol_metadata_defaults_for_old_payloads_and_validates_on_save() {
+        let old = serde_json::json!({
+            "id":"old", "providerName":"Old", "baseUrl":"https://upstream.example.test/v1",
+            "model":"gpt-test", "apiKey":null, "tomlConfig":null,
+            "wireApi":"responses", "requiresOpenaiAuth":false,
+        });
+        let parsed = serde_json::from_value::<SavedProvider>(old).unwrap();
+        assert!(parsed.upstream_api.is_none());
+        for protocol in [
+            "responses",
+            "chat_completions",
+            "anthropic_messages",
+            "gemini",
+        ] {
+            let mut selected = provider("bridge", "Bridge", None);
+            selected.upstream_api = Some(format!(" {protocol} "));
+            selected.toml_config = Some(HEADER_CONFIG.to_string());
+            let normalized = normalize_saved_provider(selected).unwrap();
+            assert_eq!(normalized.upstream_api.as_deref(), Some(protocol));
+            assert_eq!(normalized.wire_api, "responses");
+            let doc = normalized
+                .toml_config
+                .unwrap()
+                .parse::<DocumentMut>()
+                .unwrap();
+            assert_eq!(
+                doc["model_providers"]["custom"]["wire_api"].as_str(),
+                Some("responses")
+            );
+            assert!(doc["model_providers"]["custom"]
+                .as_table()
+                .unwrap()
+                .get("upstream_api")
+                .is_none());
+        }
+        let mut invalid = provider("bad-protocol", "Bad protocol", None);
+        invalid.upstream_api = Some("unknown".into());
+        assert!(normalize_saved_provider(invalid)
+            .unwrap_err()
+            .to_string()
+            .contains("上游协议"));
+    }
+
+    #[test]
+    fn legacy_chat_wire_api_migrates_to_independent_bridge_metadata() {
+        for legacy in ["chat", "chat_completions"] {
+            let conn = test_connection();
+            let mut old = provider("legacy-chat", "Legacy chat", None);
+            old.toml_config = Some(HEADER_CONFIG.replace(
+                "wire_api = \"responses\"",
+                &format!("wire_api = \"{legacy}\""),
+            ));
+            // The TOML remains authoritative when old DB scalar columns disagree.
+            write_provider_on_connection(&conn, &old).unwrap();
+            let migrated = provider_by_id_on_connection(&conn, &old.id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(migrated.wire_api, "responses");
+            assert_eq!(migrated.upstream_api.as_deref(), Some("chat_completions"));
+            let text = migrated.toml_config.as_ref().unwrap();
+            assert!(text.contains("# keep the shared configuration"));
+            assert_eq!(
+                text.parse::<DocumentMut>().unwrap()["model_providers"]["custom"]["wire_api"]
+                    .as_str(),
+                Some("responses")
+            );
+            let saved = save_manual_provider_on_connection(&conn, migrated).unwrap();
+            assert_eq!(saved.upstream_api.as_deref(), Some("chat_completions"));
+            assert_eq!(
+                conn.query_row(
+                    "SELECT wire_api FROM providers WHERE id=?1",
+                    [&saved.id],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+                "responses"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_legacy_wire_api_remains_readable_and_is_rejected_on_save() {
+        let conn = test_connection();
+        let mut unknown = provider("unknown-wire", "Unknown wire", None);
+        unknown.wire_api = "unrecognized-wire-format".into();
+        write_provider_on_connection(&conn, &unknown).unwrap();
+        let read = provider_by_id_on_connection(&conn, &unknown.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.wire_api, "unrecognized-wire-format");
+        assert!(read.upstream_api.is_none());
+        assert!(save_manual_provider_on_connection(&conn, read)
+            .unwrap_err()
+            .to_string()
+            .contains("wire_api 不受支持"));
+    }
+
+    #[test]
+    fn edits_from_older_clients_keep_bridge_metadata_until_explicitly_reset() {
+        let conn = test_connection();
+        let mut configured = provider("configured", "Configured", None);
+        configured.upstream_api = Some("anthropic_messages".into());
+        let saved = save_manual_provider_on_connection(&conn, configured).unwrap();
+        let mut older_edit = saved.clone();
+        older_edit.upstream_api = None;
+        older_edit.provider_name = "Renamed".into();
+        let preserved = save_manual_provider_on_connection(&conn, older_edit).unwrap();
+        assert_eq!(preserved.upstream_api, saved.upstream_api);
+        let mut native = preserved;
+        native.upstream_api = Some("responses".into());
+        let reset = save_manual_provider_on_connection(&conn, native).unwrap();
+        assert_eq!(reset.upstream_api.as_deref(), Some("responses"));
+    }
+
+    #[test]
+    fn upstream_metadata_and_headers_survive_store_copy_import_refresh_and_snapshot_restore() {
+        let mut conn = test_connection();
+        let mut original = provider("gemini-bridge", "Gemini bridge", Some("fixture-key"));
+        original.upstream_api = Some("gemini".into());
+        original.toml_config = Some(HEADER_CONFIG.to_string());
+        let original = normalize_saved_provider(original).unwrap();
+        let saved =
+            upsert_ccswitch_provider_on_connection(&conn, original.clone(), "ccswitch-fixture")
+                .unwrap()
+                .provider;
+        assert_eq!(saved.upstream_api.as_deref(), Some("gemini"));
+        let copied = duplicate_provider_on_connection(
+            &mut conn,
+            std::path::Path::new("/fixture/upstream-copy"),
+            None,
+            Some(&saved.id),
+            None,
+        )
+        .unwrap()
+        .provider;
+        assert_eq!(copied.upstream_api, saved.upstream_api);
+        assert_eq!(
+            read_provider_headers_inner(copied.toml_config.unwrap()).unwrap(),
+            read_provider_headers_inner(saved.toml_config.clone().unwrap()).unwrap()
+        );
+        let mut incoming = original;
+        incoming.upstream_api = None;
+        let refreshed = upsert_ccswitch_provider_on_connection(&conn, incoming, "ccswitch-fixture")
+            .unwrap()
+            .provider;
+        assert_eq!(refreshed.upstream_api.as_deref(), Some("gemini"));
+        let snapshots = stored_providers_on_connection(&conn).unwrap();
+        let restored = test_connection();
+        for snapshot in &snapshots {
+            insert_stored_provider(&restored, snapshot).unwrap();
+        }
+        assert_eq!(
+            stored_providers_on_connection(&restored).unwrap(),
+            snapshots
+        );
     }
 
     fn provider_count(conn: &Connection) -> usize {
@@ -2130,6 +2679,7 @@ enabled = true
             toml_config: Some("\n".to_string()),
             wire_api: String::new(),
             requires_openai_auth: false,
+            upstream_api: None,
             model_mappings: Vec::new(),
         };
         let result = upsert_ccswitch_provider_on_connection(&conn, missing, "cc-row")
@@ -2374,7 +2924,8 @@ command = "keep-this-command"
         assert_eq!(normalized.provider_name, "Edited Name");
         assert_eq!(normalized.base_url, "https://edited.example.com/v1");
         assert_eq!(normalized.model, "edited-model");
-        assert_eq!(normalized.wire_api, "chat_completions");
+        assert_eq!(normalized.wire_api, "responses");
+        assert_eq!(normalized.upstream_api.as_deref(), Some("chat_completions"));
         assert!(!normalized.requires_openai_auth);
         assert_eq!(doc["model"].as_str(), Some("edited-model"));
         assert_eq!(
@@ -2387,7 +2938,7 @@ command = "keep-this-command"
         );
         assert_eq!(
             doc["model_providers"]["proxy"]["wire_api"].as_str(),
-            Some("chat_completions")
+            Some("responses")
         );
         assert_eq!(
             doc["model_providers"]["proxy"]["requires_openai_auth"].as_bool(),

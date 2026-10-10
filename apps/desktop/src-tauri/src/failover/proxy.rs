@@ -4,6 +4,7 @@
 use super::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use super::config::RoutingTuning;
 use super::native_official::{OfficialRequestAuth, OfficialRouteSpec};
+use super::protocol::{self, UpstreamApi};
 use crate::error::{CodexxError, Result};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -35,6 +36,7 @@ pub(crate) struct ProxyRoute {
     pub(crate) headers: Vec<(String, String)>,
     pub(crate) models: HashSet<String>,
     pub(crate) official: Option<OfficialRouteSpec>,
+    pub(crate) protocol: UpstreamApi,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -435,6 +437,7 @@ fn reject_self_routes(routes: &[ProxyRoute], address: IpAddr, port: u16) -> Resu
 
 fn same_transport(left: &ProxyRoute, right: &ProxyRoute) -> bool {
     left.base_url == right.base_url
+        && left.protocol == right.protocol
         && left.api_key == right.api_key
         && left.headers == right.headers
         && left.models == right.models
@@ -1026,7 +1029,64 @@ fn upstream_url(route: &ProxyRoute, data: &RequestData) -> Option<String> {
     let base_path = url.path().trim_end_matches('/');
     // Saved base_url is the API prefix, matching Codex's own /responses join.
     // Do not invent /v1 for vendor endpoints that deliberately omit it.
-    url.set_path(&format!("{base_path}/{}", data.suffix));
+    let path = match route.protocol {
+        UpstreamApi::Responses => format!("{base_path}/{}", data.suffix),
+        UpstreamApi::ChatCompletions => {
+            if base_path.ends_with("/chat/completions") {
+                base_path.to_owned()
+            } else {
+                format!(
+                    "{}/chat/completions",
+                    if base_path.is_empty() {
+                        "/v1"
+                    } else {
+                        base_path
+                    }
+                )
+            }
+        }
+        UpstreamApi::AnthropicMessages => {
+            if base_path.ends_with("/messages") {
+                base_path.to_owned()
+            } else if base_path.ends_with("/v1") {
+                format!("{base_path}/messages")
+            } else {
+                format!("{base_path}/v1/messages")
+            }
+        }
+        UpstreamApi::Gemini => {
+            let model = data
+                .model
+                .as_deref()?
+                .strip_prefix("models/")
+                .unwrap_or(data.model.as_deref()?);
+            if model.is_empty() || model.contains('/') || model.contains(':') {
+                return None;
+            }
+            let model =
+                percent_encoding::utf8_percent_encode(model, percent_encoding::NON_ALPHANUMERIC)
+                    .to_string();
+            let method = if data.streaming {
+                "streamGenerateContent"
+            } else {
+                "generateContent"
+            };
+            if base_path.contains("/models/") {
+                let (prefix, _) = base_path.rsplit_once("/models/")?;
+                format!("{prefix}/models/{model}:{method}")
+            } else {
+                format!(
+                    "{}/models/{model}:{method}",
+                    if base_path.is_empty() {
+                        "/v1beta"
+                    } else {
+                        base_path
+                    }
+                )
+            }
+        }
+    };
+    url.set_path(&path);
     let query = match (url.query(), data.query.as_deref()) {
         (Some(base), Some(request)) if !base.is_empty() && !request.is_empty() => {
             Some(format!("{base}&{request}"))
@@ -1036,6 +1096,9 @@ fn upstream_url(route: &ProxyRoute, data: &RequestData) -> Option<String> {
         (None, None) => None,
     };
     url.set_query(query.as_deref());
+    if route.protocol == UpstreamApi::Gemini && data.streaming {
+        url.query_pairs_mut().append_pair("alt", "sse");
+    }
     Some(url.into())
 }
 
@@ -1108,6 +1171,7 @@ struct UpstreamResponse {
     headers: reqwest::header::HeaderMap,
     deadline: Option<Instant>,
     next_timeout: Option<Duration>,
+    idle_timeout: Option<Duration>,
     pending: Vec<u8>,
     offset: usize,
 }
@@ -1123,6 +1187,7 @@ impl Read for UpstreamResponse {
                 let count = bytes.len().min(self.pending.len() - self.offset);
                 bytes[..count].copy_from_slice(&self.pending[self.offset..self.offset + count]);
                 self.offset += count;
+                self.next_timeout = self.idle_timeout;
                 return Ok(count);
             }
             let deadline = match (self.deadline, idle_deadline) {
@@ -1167,6 +1232,7 @@ fn request_upstream(
     data: &RequestData,
     timing: RequestTimeouts,
     official: Option<&OfficialRequestAuth>,
+    body: &[u8],
 ) -> std::result::Result<UpstreamResponse, ()> {
     let mut effective = route.clone();
     if let Some(auth) = official {
@@ -1216,11 +1282,61 @@ fn request_upstream(
                 reqwest::header::HeaderValue::from_str(account).map_err(|_| ())?,
             );
         }
-    } else if let Some(key) = route.api_key.as_deref().filter(|key| !key.is_empty()) {
-        let mut value =
-            reqwest::header::HeaderValue::from_str(&format!("Bearer {key}")).map_err(|_| ())?;
-        value.set_sensitive(true);
-        headers.insert(reqwest::header::AUTHORIZATION, value);
+    } else {
+        // Supplier credentials belong to its route snapshot. Neither local
+        // router authentication nor another protocol's default key is reused.
+        for name in [
+            "authorization",
+            "x-api-key",
+            "x-goog-api-key",
+            "chatgpt-account-id",
+        ] {
+            headers.remove(name);
+        }
+        if route.protocol == UpstreamApi::AnthropicMessages {
+            headers.insert(
+                "anthropic-version",
+                reqwest::header::HeaderValue::from_static("2023-06-01"),
+            );
+        }
+        let custom_auth = route.headers.iter().any(|(name, _)| {
+            matches!(
+                name.to_ascii_lowercase().as_str(),
+                "authorization" | "x-api-key" | "x-goog-api-key"
+            )
+        });
+        if let Some(key) = route
+            .api_key
+            .as_deref()
+            .filter(|key| !key.is_empty() && !custom_auth)
+        {
+            let (name, text) = match route.protocol {
+                UpstreamApi::Responses | UpstreamApi::ChatCompletions => {
+                    ("authorization", format!("Bearer {key}"))
+                }
+                UpstreamApi::AnthropicMessages => ("x-api-key", key.to_owned()),
+                UpstreamApi::Gemini => ("x-goog-api-key", key.to_owned()),
+            };
+            let mut value = reqwest::header::HeaderValue::from_str(&text).map_err(|_| ())?;
+            value.set_sensitive(true);
+            headers.insert(
+                reqwest::header::HeaderName::from_bytes(name.as_bytes()).map_err(|_| ())?,
+                value,
+            );
+        }
+        // Explicit supplier headers override defaults. Client headers are
+        // restricted independently and cannot override supplier credentials.
+        for (name, value) in &route.headers {
+            if !forbidden_upstream_header(name)
+                && !name.eq_ignore_ascii_case(super::config::ROUTE_TOKEN_HEADER)
+                && !name.eq_ignore_ascii_case(super::config::ROUTE_GENERATION_HEADER)
+            {
+                headers.insert(
+                    reqwest::header::HeaderName::from_bytes(name.as_bytes()).map_err(|_| ())?,
+                    reqwest::header::HeaderValue::from_str(value).map_err(|_| ())?,
+                );
+            }
+        }
     }
     headers.insert(
         reqwest::header::CONTENT_TYPE,
@@ -1241,7 +1357,7 @@ fn request_upstream(
     let request = if data.model.is_none() {
         client.get(&url)
     } else {
-        client.post(&url).body(data.bytes.clone())
+        client.post(&url).body(body.to_vec())
     }
     .headers(headers);
     let started = Instant::now();
@@ -1275,6 +1391,7 @@ fn request_upstream(
         } else {
             None
         },
+        idle_timeout: if data.streaming { timing.idle } else { None },
         pending: Vec::new(),
         offset: 0,
     })
@@ -1325,6 +1442,82 @@ fn buffered_response(mut response: UpstreamResponse) -> io::Result<BufferedRespo
         status,
         headers,
         bytes: read_bounded(&mut response, limit)?,
+    })
+}
+
+fn bridge_buffered(
+    mut response: BufferedResponse,
+    route: &ProxyRoute,
+    prepared: &protocol::PreparedRequest,
+) -> io::Result<BufferedResponse> {
+    if route.protocol == UpstreamApi::Responses {
+        return Ok(response);
+    }
+    let body: Value = serde_json::from_slice(&response.bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "上游响应不是有效的 JSON"))?;
+    if response.status >= 300 {
+        let message = protocol::error_message(&body).unwrap_or_else(|| body.to_string());
+        response.bytes = serde_json::to_vec(
+            &json!({"error":{"type":"upstream_error","code":"upstream_error","message":message}}),
+        )
+        .unwrap_or_default();
+    } else {
+        let body =
+            protocol::convert_response(route.protocol, &body, &prepared.context, &prepared.model)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        response.bytes = serde_json::to_vec(&body).map_err(io::Error::other)?;
+    }
+    response
+        .headers
+        .retain(|(name, _)| !name.eq_ignore_ascii_case("content-type"));
+    response
+        .headers
+        .push(("content-type".into(), "application/json".into()));
+    Ok(response)
+}
+
+fn bridge_nonstream_sse(
+    response: UpstreamResponse,
+    route: &ProxyRoute,
+    prepared: &protocol::PreparedRequest,
+) -> io::Result<BufferedResponse> {
+    let mut headers = downstream_headers(&response);
+    let mut reader = protocol::ResponseStream::new(
+        response,
+        route.protocol,
+        prepared.context.clone(),
+        prepared.model.clone(),
+    );
+    let bytes = read_bounded(&mut reader, MAX_BODY_BYTES)?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "转换后的 SSE 不是 UTF-8"))?;
+    let event = text
+        .lines()
+        .rev()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+        .find(|v| {
+            matches!(
+                v.get("type").and_then(Value::as_str),
+                Some("response.completed" | "response.incomplete" | "response.failed")
+            )
+        })
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "上游 SSE 缺少完成事件"))?;
+    if event["type"] == "response.failed" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            event
+                .pointer("/response/error/message")
+                .and_then(Value::as_str)
+                .unwrap_or("上游 SSE 失败"),
+        ));
+    }
+    headers.retain(|(name, _)| !name.eq_ignore_ascii_case("content-type"));
+    headers.push(("content-type".into(), "application/json".into()));
+    Ok(BufferedResponse {
+        status: 200,
+        headers,
+        bytes: serde_json::to_vec(&event["response"]).map_err(io::Error::other)?,
     })
 }
 
@@ -1520,6 +1713,17 @@ fn handle_request(mut request: Request, shared: &Arc<Shared>) {
         }
         return;
     }
+    if data.model.is_none()
+        && config
+            .routes
+            .first()
+            .is_some_and(|route| route.protocol.requires_routing())
+    {
+        let mut models: Vec<_> = config.routes[0].models.iter().cloned().collect();
+        models.sort();
+        respond_buffered(request,BufferedResponse {status:200,headers:vec![("content-type".into(),"application/json".into())],bytes:serde_json::to_vec(&json!({"object":"list","data":models.into_iter().map(|id|json!({"id":id,"object":"model","owned_by":"supplier"})).collect::<Vec<_>>()})).unwrap_or_default()});
+        return;
+    }
     let automatic = config.options.auto_failover_enabled && !official;
     let max_attempts = if automatic {
         config.options.tuning.max_retries.saturating_add(1) as usize
@@ -1529,6 +1733,7 @@ fn handle_request(mut request: Request, shared: &Arc<Shared>) {
     let timing = timeouts(shared, &config.options, official);
     let mut attempted = 0;
     let mut last_response = None;
+    let mut last_bridge_error = None;
     for (index, route) in config.routes.iter().enumerate() {
         if shared.stopped.load(Ordering::Acquire) {
             fail_request(shared);
@@ -1541,11 +1746,37 @@ fn handle_request(mut request: Request, shared: &Arc<Shared>) {
         if index > 0 && (!automatic || data.primary_only) {
             break;
         }
+        let prepared = match if data.model.is_none() {
+            Ok(protocol::PreparedRequest {
+                bytes: data.bytes.clone(),
+                context: protocol::ToolContext::default(),
+                model: String::new(),
+            })
+        } else {
+            protocol::prepare(
+                route.protocol,
+                &data.bytes,
+                data.suffix == "responses/compact",
+            )
+        } {
+            Ok(prepared) => prepared,
+            Err(message) => {
+                fail_request(shared);
+                respond_error(request, 400, &message);
+                return;
+            }
+        };
         let Some(mut permit) = Permit::acquire(&breakers, route, automatic) else {
             continue;
         };
         attempted += 1;
-        let mut response = match request_upstream(route, &data, timing, official_auth.as_ref()) {
+        let response = match request_upstream(
+            route,
+            &data,
+            timing,
+            official_auth.as_ref(),
+            &prepared.bytes,
+        ) {
             Ok(response) => response,
             Err(()) => {
                 set_attempt_failure(
@@ -1572,7 +1803,7 @@ fn handle_request(mut request: Request, shared: &Arc<Shared>) {
                 Some(status),
                 "供应商暂时不可用",
             );
-            last_response = Some(response);
+            last_response = Some((response, route.clone(), prepared));
             continue;
         }
         if (300..=399).contains(&status) {
@@ -1595,7 +1826,9 @@ fn handle_request(mut request: Request, shared: &Arc<Shared>) {
             if let Some(health) = lock(&shared.statistics).health.get_mut(&route.id) {
                 health.last_status = Some(status);
             }
-            match buffered_response(response) {
+            match buffered_response(response)
+                .and_then(|response| bridge_buffered(response, route, &prepared))
+            {
                 Ok(response) => respond_buffered(request, response),
                 Err(_) => respond_error(request, 502, "供应商响应无法读取"),
             };
@@ -1614,11 +1847,49 @@ fn handle_request(mut request: Request, shared: &Arc<Shared>) {
                         .trim()
                         .eq_ignore_ascii_case("text/event-stream")
                 });
+        if !data.streaming && streaming && route.protocol.requires_routing() {
+            match bridge_nonstream_sse(response, route, &prepared) {
+                Ok(response) => {
+                    set_success(shared, &config, route, &mut permit, index, status);
+                    respond_buffered(request, response);
+                    return;
+                }
+                Err(error) => {
+                    last_bridge_error = Some(error.to_string());
+                    set_attempt_failure(
+                        shared,
+                        &config,
+                        route,
+                        &mut permit,
+                        Some(status),
+                        "供应商 SSE 返回无法转换为完整 JSON",
+                    );
+                    continue;
+                }
+            }
+        }
         if streaming {
-            let headers = downstream_headers(&response);
+            let mut headers = downstream_headers(&response);
+            if route.protocol.requires_routing() {
+                headers.retain(|(name, _)| !name.eq_ignore_ascii_case("content-type"));
+                headers.push(("content-type".into(), "text/event-stream".into()));
+            }
+            let mut bridge_failure = None;
+            let mut reader: Box<dyn Read + Send + Sync> = if route.protocol.requires_routing() {
+                let converted = protocol::ResponseStream::new(
+                    response,
+                    route.protocol,
+                    prepared.context,
+                    prepared.model,
+                );
+                bridge_failure = Some(converted.failure_flag());
+                Box::new(converted)
+            } else {
+                Box::new(response)
+            };
             let mut first = [0; 16 * 1024];
-            let count = match response.read(&mut first) {
-                Ok(0) | Err(_) => {
+            let count = match reader.read(&mut first) {
+                Ok(0) => {
                     set_attempt_failure(
                         shared,
                         &config,
@@ -1632,20 +1903,31 @@ fn handle_request(mut request: Request, shared: &Arc<Shared>) {
                     }
                     continue;
                 }
+                Err(error) => {
+                    if route.protocol.requires_routing() {
+                        last_bridge_error = Some(error.to_string());
+                    }
+                    set_attempt_failure(
+                        shared,
+                        &config,
+                        route,
+                        &mut permit,
+                        Some(status),
+                        "供应商首包读取或协议转换失败",
+                    );
+                    if official {
+                        break;
+                    }
+                    continue;
+                }
                 Ok(count) => count,
             };
-            response.next_timeout = timing.idle;
             set_success(shared, &config, route, &mut permit, index, status);
             if matches!(
-                stream_response(
-                    request,
-                    status,
-                    headers,
-                    &first[..count],
-                    Box::new(response)
-                ),
+                stream_response(request, status, headers, &first[..count], reader),
                 StreamOutcome::UpstreamFailure
-            ) {
+            ) || bridge_failure.is_some_and(|flag| flag.load(Ordering::Acquire))
+            {
                 // Like CC Switch, after the committed first chunk this is a
                 // downstream stream failure, never a fresh provider attempt.
                 let mut stats = lock(&shared.statistics);
@@ -1653,13 +1935,18 @@ fn handle_request(mut request: Request, shared: &Arc<Shared>) {
             }
             return;
         }
-        match buffered_response(response) {
+        match buffered_response(response)
+            .and_then(|response| bridge_buffered(response, route, &prepared))
+        {
             Ok(response) => {
                 set_success(shared, &config, route, &mut permit, index, status);
                 respond_buffered(request, response);
                 return;
             }
-            Err(_) => {
+            Err(error) => {
+                if route.protocol.requires_routing() {
+                    last_bridge_error = Some(error.to_string());
+                }
                 set_attempt_failure(
                     shared,
                     &config,
@@ -1675,11 +1962,15 @@ fn handle_request(mut request: Request, shared: &Arc<Shared>) {
         }
     }
     fail_request(shared);
-    if let Some(response) = last_response {
-        match buffered_response(response) {
+    if let Some((response, route, prepared)) = last_response {
+        match buffered_response(response)
+            .and_then(|response| bridge_buffered(response, &route, &prepared))
+        {
             Ok(response) => respond_buffered(request, response),
             Err(_) => respond_error(request, 502, "暂时无法连接可用供应商，请稍后重试"),
         }
+    } else if let Some(error) = last_bridge_error {
+        respond_error(request, 502, &format!("上游协议转换失败：{error}"));
     } else if attempted > 0 {
         respond_error(request, 502, "暂时无法连接可用供应商，请稍后重试");
     } else {
@@ -1928,11 +2219,186 @@ mod tests {
             headers: Vec::new(),
             models: HashSet::from([MODEL.to_string()]),
             official: None,
+            protocol: UpstreamApi::Responses,
         }
     }
 
     fn start(routes: Vec<ProxyRoute>) -> ProxyHandle {
         ProxyHandle::start_with_timeout(0, TOKEN.into(), routes, Duration::from_secs(2)).unwrap()
+    }
+
+    #[test]
+    fn protocol_bridges_use_correct_endpoints_auth_and_codex_json() {
+        for (api, reply) in [
+            (
+                UpstreamApi::ChatCompletions,
+                r#"{"id":"chat","model":"fixture-model","choices":[{"message":{"content":"chat reply"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":3}}"#,
+            ),
+            (
+                UpstreamApi::AnthropicMessages,
+                r#"{"id":"anth","model":"fixture-model","type":"message","content":[{"type":"text","text":"anthropic reply"}],"stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":3}}"#,
+            ),
+            (
+                UpstreamApi::Gemini,
+                r#"{"responseId":"gem","candidates":[{"content":{"parts":[{"text":"gemini reply"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":2,"candidatesTokenCount":3}}"#,
+            ),
+        ] {
+            let upstream = Upstream::json(200, reply);
+            let mut supplier = route("converted", &upstream, "fixture-secret");
+            supplier.protocol = api;
+            let proxy = start(vec![supplier]);
+            let body: Value =
+                serde_json::from_str(&request(&proxy, &payload()).into_string().unwrap()).unwrap();
+            assert_eq!(body["object"], "response");
+            assert_eq!(body["status"], "completed");
+            assert_eq!(body["usage"]["total_tokens"], 5);
+            let calls = upstream.observed();
+            let seen = &calls[0];
+            let converted: Value = serde_json::from_slice(&seen.body).unwrap();
+            match api {
+                UpstreamApi::ChatCompletions => {
+                    assert_eq!(seen.target, "/v1/chat/completions");
+                    assert_eq!(seen.headers["authorization"], "Bearer fixture-secret");
+                    assert_eq!(converted["messages"][0]["content"], "fixture prompt");
+                }
+                UpstreamApi::AnthropicMessages => {
+                    assert_eq!(seen.target, "/v1/messages");
+                    assert_eq!(seen.headers["x-api-key"], "fixture-secret");
+                    assert_eq!(seen.headers["anthropic-version"], "2023-06-01");
+                    assert!(!seen.headers.contains_key("authorization"));
+                    assert_eq!(converted["max_tokens"], 8192);
+                }
+                UpstreamApi::Gemini => {
+                    assert!(seen.target.starts_with("/v1beta/models/fixture"));
+                    assert!(seen.target.ends_with(":generateContent"));
+                    assert_eq!(seen.headers["x-goog-api-key"], "fixture-secret");
+                    assert!(!seen.headers.contains_key("authorization"));
+                    assert_eq!(converted["contents"][0]["role"], "user");
+                }
+                _ => unreachable!(),
+            }
+            assert!(!seen.headers.values().any(|v| v.contains(TOKEN)));
+            let models = client()
+                .get(&format!("http://127.0.0.1:{}/v1/models", proxy.port()))
+                .set("Authorization", &format!("Bearer {TOKEN}"))
+                .call()
+                .unwrap()
+                .into_string()
+                .unwrap();
+            let models: Value = serde_json::from_str(&models).unwrap();
+            assert_eq!(models["object"], "list");
+            assert_eq!(models["data"][0]["id"], MODEL);
+            assert_eq!(upstream.observed().len(), 1);
+            proxy.shutdown();
+        }
+    }
+
+    #[test]
+    fn converted_routes_reject_remote_state_and_compaction_without_upstream_request() {
+        let upstream = Upstream::json(200, "{}");
+        let mut supplier = route("converted", &upstream, "fixture-secret");
+        supplier.protocol = UpstreamApi::Gemini;
+        let proxy = start(vec![supplier]);
+        let error = client()
+            .post(&format!("http://127.0.0.1:{}/v1/responses", proxy.port()))
+            .set("Authorization", &format!("Bearer {TOKEN}"))
+            .set("Content-Type", "application/json")
+            .send_string(
+                &json!({"model":MODEL,"input":"x","previous_response_id":"opaque-server-state"})
+                    .to_string(),
+            )
+            .unwrap_err();
+        assert!(matches!(error, ureq::Error::Status(400, _)));
+        let error = client()
+            .post(&format!(
+                "http://127.0.0.1:{}/v1/responses/compact",
+                proxy.port()
+            ))
+            .set("Authorization", &format!("Bearer {TOKEN}"))
+            .set("Content-Type", "application/json")
+            .send_string(&json!({"model":MODEL,"input":"x"}).to_string())
+            .unwrap_err();
+        assert!(matches!(error, ureq::Error::Status(400, _)));
+        assert!(upstream.observed().is_empty());
+        proxy.shutdown();
+    }
+
+    #[test]
+    fn early_bridge_sse_error_can_fail_over_but_committed_output_is_not_replayed() {
+        let early = Upstream::serve(|stream| {
+            let data = "event: error\ndata: {\"error\":{\"message\":\"fixture outage\"}}\n\n";
+            write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{data}",data.len()).unwrap();
+        });
+        let backup = Upstream::json(
+            200,
+            r#"{"id":"backup","choices":[{"message":{"content":"recovered"},"finish_reason":"stop"}]}"#,
+        );
+        let mut first = route("early", &early, "one");
+        first.protocol = UpstreamApi::ChatCompletions;
+        let mut second = route("backup", &backup, "two");
+        second.protocol = UpstreamApi::ChatCompletions;
+        let proxy = start(vec![first, second]);
+        let result = request(&proxy, &stream_payload()).into_string().unwrap();
+        assert!(result.contains("response.completed"));
+        assert!(result.contains("recovered"));
+        assert_eq!(backup.observed().len(), 1);
+        proxy.shutdown();
+        let (release, await_release) = mpsc::channel();
+        let late = Upstream::serve(move |stream| {
+            let first="data: {\"id\":\"partial\",\"choices\":[{\"delta\":{\"content\":\"committed\"}}]}\n\n";
+            write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{first}\r\n",first.len()).unwrap();
+            stream.flush().unwrap();
+            await_release.recv_timeout(Duration::from_secs(3)).unwrap();
+            let error = "event: error\ndata: {\"error\":{\"message\":\"late outage\"}}\n\n";
+            write!(stream, "{:x}\r\n{error}\r\n0\r\n\r\n", error.len()).unwrap();
+        });
+        let untouched = Upstream::json(200, "{}");
+        let mut first = route("late", &late, "one");
+        first.protocol = UpstreamApi::ChatCompletions;
+        let proxy = start(vec![first, route("untouched", &untouched, "two")]);
+        let result = request(&proxy, &stream_payload());
+        release.send(()).unwrap();
+        let result = result.into_string().unwrap();
+        // The client can receive EOF before the worker publishes final statistics.
+        eventually(|| proxy.snapshot().in_flight == 0);
+        assert!(result.contains("response.failed"));
+        assert!(!result.contains("response.completed"));
+        assert!(untouched.observed().is_empty());
+        assert!(proxy.snapshot().last_error.is_some());
+        proxy.shutdown();
+    }
+
+    #[test]
+    fn gemini_stream_endpoint_converts_sse_and_preserves_function_call() {
+        let upstream = Upstream::serve(|stream| {
+            let events = [
+                json!({"responseId":"g","candidates":[{"content":{"parts":[{"text":"中文🙂"}]}}]}),
+                json!({"candidates":[{"content":{"parts":[{"functionCall":{"name":"read","args":{"path":"x"}},"thoughtSignature":"fixture-signature"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":2}}),
+            ];
+            let body = events
+                .iter()
+                .map(|event| format!("data: {event}\r\n\r\n"))
+                .collect::<String>();
+            write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").unwrap();
+            for chunk in body.as_bytes().chunks(1) {
+                write!(stream, "1\r\n").unwrap();
+                stream.write_all(chunk).unwrap();
+                stream.write_all(b"\r\n").unwrap();
+            }
+            stream.write_all(b"0\r\n\r\n").unwrap();
+        });
+        let mut supplier = route("gemini", &upstream, "secret");
+        supplier.protocol = UpstreamApi::Gemini;
+        let proxy = start(vec![supplier]);
+        let bytes=serde_json::to_vec(&json!({"model":MODEL,"input":"x","stream":true,"tools":[{"type":"function","name":"read"}]})).unwrap();
+        let output = request(&proxy, &bytes).into_string().unwrap();
+        assert!(output.contains("response.completed"));
+        assert!(output.contains("中文🙂"));
+        assert!(output.contains("function_call"));
+        assert!(output.contains("encrypted_content"));
+        let seen = &upstream.observed()[0];
+        assert!(seen.target.contains(":streamGenerateContent?alt=sse"));
+        proxy.shutdown();
     }
 
     fn client() -> ureq::Agent {

@@ -36,6 +36,7 @@ export type SavedProvider = {
   apiKey?: string;
   tomlConfig?: string;
   wireApi: string;
+  upstreamApi?: string | null;
   requiresOpenaiAuth: boolean;
   modelMappings?: ProviderModelMapping[];
 };

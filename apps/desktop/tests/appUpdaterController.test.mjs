@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { AppUpdaterController, isAppUpdateBusy, UPDATER_SLOW_NOTICE_MS } from "../src/appUpdaterController.ts";
+import { AppUpdaterController, appUpdaterCheckFailureMessage, classifyAppUpdaterCheckError, isAppUpdateBusy, UPDATER_SLOW_NOTICE_MS } from "../src/appUpdaterController.ts";
 
 function deferred() {
   let resolve, reject;
@@ -197,4 +197,131 @@ test("a pending forced check cannot install its stale update resource", async ()
   next.resolve(null);
   await check;
   assert.equal(f.counts.closes, 1);
+});
+
+
+const checkFailures = [
+  ["timeout", new Error("error sending request: operation timed out at https://private.fixture.test/update?token=private-secret")],
+  ["network", { code: "NetworkError", message: "connection refused; Authorization: Bearer private-secret at https://private.fixture.test" }],
+  ["platform", "the platform `windows-x86_64` was not found in the response `platforms` object"],
+  ["platform", new Error("Unsupported application architecture, expected x86 or aarch64")],
+  ["invalid-release", "Could not fetch a valid release JSON from the remote"],
+  ["invalid-release", { code: "Serialization", message: "missing field `signature` at line 1 column 1: private-secret" }],
+  ["public-key", "Could not decode public key or signature: private-secret"],
+  ["unknown", { message: "Something unexpected happened: private-secret", url: "https://private.fixture.test", authorization: "Bearer private-secret" }],
+];
+
+test("check failures are classified into fixed safe explanations in both languages", () => {
+  for (const [kind, cause] of checkFailures) {
+    assert.equal(classifyAppUpdaterCheckError(cause), kind);
+    for (const lang of ["zh", "en"]) {
+      const message = appUpdaterCheckFailureMessage(kind, lang);
+      assert.ok(message.length > 20);
+      assert.ok(!message.includes("private-secret"));
+      assert.ok(!message.includes("https://"));
+      assert.ok(!message.includes("Authorization"));
+    }
+  }
+  for (const cause of [null, undefined, 123, false, {}, { message: {} }]) assert.equal(classifyAppUpdaterCheckError(cause), "unknown");
+  assert.equal(classifyAppUpdaterCheckError("Unrecognized error https://fixture.test/timeout?publickey=secret"), "unknown", "URL text alone must not invent the reason");
+});
+
+test("SDK check rejection retains a safe cause without any raw endpoint or credentials", async () => {
+  for (const [kind, cause] of checkFailures) {
+    const f = fixture();
+    const rejected = deferred();
+    f.setCheckOperation(rejected);
+    const job = f.controller.check();
+    rejected.reject(cause);
+    assert.equal(await job, "error");
+    const state = f.controller.getSnapshot();
+    assert.equal(state.phase, "error");
+    assert.equal(state.failure, "check");
+    assert.equal(state.checkFailure, kind);
+    assert.equal(state.errorMessage, appUpdaterCheckFailureMessage(kind));
+    const visible = JSON.stringify(state);
+    for (const secret of ["private-secret", "private.fixture.test", "Authorization", "Bearer"]) assert.ok(!visible.includes(secret));
+    assert.equal(f.counts.installs, 0);
+  }
+});
+
+test("failed forced checks release their prior RID and clear stale release details", async () => {
+  const f = fixture();
+  f.setUpdate({ rid: 21, currentVersion: "0.3.21", version: "0.3.24", body: "Old release notes", date: "2026-10-01", close: async () => { f.counts.closes++; } });
+  await f.controller.check();
+  assert.equal(f.controller.getSnapshot().latestVersion, "0.3.24");
+  const failed = deferred();
+  f.setCheckOperation(failed);
+  const job = f.controller.check({ force: true });
+  assert.equal(f.controller.getSnapshot().latestVersion, null);
+  assert.equal(f.controller.getSnapshot().notes, null);
+  failed.reject(new Error("NetworkError: connection refused"));
+  await job;
+  assert.equal(f.counts.closes, 1);
+  assert.equal(f.controller.getSnapshot().failure, "check");
+  assert.equal(f.controller.getSnapshot().checkFailure, "network");
+  for (const field of ["latestVersion", "notes", "publishedAt"]) assert.equal(f.controller.getSnapshot()[field], null);
+  assert.equal(await f.controller.downloadAndInstall(), "error");
+  assert.equal(f.counts.installs, 0, "failed SDK metadata cannot authorize an installer");
+});
+
+test("retry checks again and installation requires a newly obtained legal SDK RID", async () => {
+  const f = fixture();
+  const failed = deferred();
+  f.setCheckOperation(failed);
+  const first = f.controller.check();
+  failed.reject(new Error("operation timed out"));
+  await first;
+  const pending = deferred();
+  f.setCheckOperation(pending);
+  const retry = f.controller.retry();
+  assert.equal(f.counts.checks, 2);
+  assert.equal(f.controller.getSnapshot().phase, "checking");
+  assert.equal(await f.controller.downloadAndInstall(), "checking");
+  assert.equal(f.counts.installs, 0);
+  pending.resolve({ rid: 24, currentVersion: "0.3.21", version: "0.3.24", body: "New release", close: async () => { f.counts.closes++; } });
+  assert.equal(await retry, "available");
+  assert.equal(f.controller.getSnapshot().errorMessage, null);
+  assert.equal(f.controller.getSnapshot().checkFailure, null);
+  assert.equal(f.counts.installs, 0, "retrying the check must not automatically install");
+  const installing = f.controller.downloadAndInstall();
+  assert.equal(f.operation.value.rid, 24);
+  assert.equal(f.counts.installs, 1);
+  f.operation.resolve({ restartRequired: true });
+  assert.equal(await installing, "ready");
+});
+
+test("invalid SDK resource IDs are closed and can never reach installation", async () => {
+  for (const rid of [-1, NaN, Infinity, 1.5, 0x1_0000_0000, "24", undefined]) {
+    const f = fixture();
+    f.setUpdate({ rid, currentVersion: "0.3.21", version: "0.3.24", close: async () => { f.counts.closes++; } });
+    assert.equal(await f.controller.check(), "error", String(rid));
+    assert.equal(f.controller.getSnapshot().checkFailure, "invalid-release");
+    assert.equal(f.counts.closes, 1);
+    assert.equal(await f.controller.downloadAndInstall(), "error");
+    assert.equal(f.counts.installs, 0);
+  }
+  const f = fixture();
+  f.setUpdate({ rid: 0, currentVersion: "0.3.21", version: "0.3.24", close: async () => { f.counts.closes++; } });
+  assert.equal(await f.controller.check(), "available", "Tauri resource IDs may start at zero");
+});
+
+
+test("automatic transport recovery starts a fresh byte count and installs only once", async () => {
+  const f = fixture();
+  await f.controller.check();
+  const job = f.controller.downloadAndInstall();
+  f.operation.onEvent({ event: "Started", data: { contentLength: 100 } });
+  f.operation.onEvent({ event: "Progress", data: { chunkLength: 45 } });
+  assert.equal(f.controller.getSnapshot().downloadedBytes, 45);
+  f.operation.onEvent({ event: "Started", data: { contentLength: 100 } });
+  assert.equal(f.controller.getSnapshot().downloadedBytes, 0);
+  f.operation.onEvent({ event: "Progress", data: { chunkLength: 100 } });
+  f.operation.onEvent({ event: "Verifying" });
+  f.operation.onEvent({ event: "Preparing" });
+  f.operation.onEvent({ event: "HandedOff" });
+  f.operation.resolve({ restartRequired: false });
+  assert.equal(await job, "handed-off");
+  assert.equal(f.counts.installs, 1);
+  assert.equal(f.counts.checks, 1);
 });

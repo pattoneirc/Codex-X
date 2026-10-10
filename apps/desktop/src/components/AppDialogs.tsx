@@ -11,6 +11,7 @@ import {
 } from "lucide-react";
 
 import { INITIAL_APP_UPDATER_STATE, isAppUpdateBusy, type AppUpdaterState } from "../appUpdater";
+import { appUpdaterCheckFailureMessage } from "../appUpdaterController";
 import type { Lang, StartupDiagnostics } from "../types";
 import { Button, ModalShell } from "./ui";
 
@@ -103,6 +104,10 @@ export function UpdateDialog({
   };
   const phase = updaterState.phase;
   const isBusy = isAppUpdateBusy(phase);
+  const checkFailed = phase === "error" && updaterState.failure === "check";
+  const failureDetails = checkFailed
+    ? appUpdaterCheckFailureMessage(updaterState.checkFailure ?? "unknown", lang)
+    : updaterState.errorMessage;
   const totalBytes = updaterState.totalBytes;
   const hasKnownProgress = totalBytes !== null && totalBytes > 0;
   const progress = totalBytes !== null && totalBytes > 0
@@ -129,8 +134,8 @@ export function UpdateDialog({
         handedOffDescription: "Codex-X 即将退出，请在安装窗口继续。首次升级旧版时，系统可能需要一次管理员授权。",
         readyTitle: "更新已准备好",
         readyDescription: "重新启动 Codex-X 即可使用新版本。",
-        errorTitle: "更新没有完成",
-        errorDescription: updaterState.failure === "restart"
+        errorTitle: checkFailed ? "在线更新检查失败" : "更新没有完成",
+        errorDescription: checkFailed ? "在线安装尚未开始。请重试在线检查；下载页可作为备用。" : updaterState.failure === "restart"
           ? "软件未能重新启动，请再试一次。"
           : "请重试；如果仍然失败，也可以前往下载页更新。",
         idleTitle: "当前已是最新版本",
@@ -152,8 +157,9 @@ export function UpdateDialog({
         detailLabel: "失败原因",
         logLabel: "安装日志",
         restart: "重新启动",
-        retry: "重试",
+        retry: checkFailed ? "重试在线检查" : "重试",
         downloadPage: "打开下载页",
+        backupDownloadPage: "打开下载页（备用）",
         releaseNotes: "本次更新",
       }
     : {
@@ -175,8 +181,8 @@ export function UpdateDialog({
         handedOffDescription: "Codex-X will exit. Continue in the installer window. Upgrading an older installation may ask for administrator permission once.",
         readyTitle: "Update is ready",
         readyDescription: "Restart Codex-X to use the new version.",
-        errorTitle: "Update did not finish",
-        errorDescription: updaterState.failure === "restart"
+        errorTitle: checkFailed ? "Online update check failed" : "Update did not finish",
+        errorDescription: checkFailed ? "Online installation has not started. Retry the online check; the download page is available as a fallback." : updaterState.failure === "restart"
           ? "Codex-X could not restart. Please try again."
           : "Try again, or use the download page if the problem continues.",
         idleTitle: "Codex-X is up to date",
@@ -198,8 +204,9 @@ export function UpdateDialog({
         detailLabel: "What went wrong",
         logLabel: "Installation log",
         restart: "Restart",
-        retry: "Try again",
+        retry: checkFailed ? "Retry online check" : "Try again",
         downloadPage: "Open download page",
+        backupDownloadPage: "Open download page (fallback)",
         releaseNotes: "What's new",
       };
 
@@ -250,7 +257,7 @@ export function UpdateDialog({
         ? (
             <>
               <Button variant="secondary" icon={<Download size={16} />} onClick={onDownload}>
-                {copy.downloadPage}
+                {checkFailed ? copy.backupDownloadPage : copy.downloadPage}
               </Button>
               <Button icon={<RotateCcw size={16} />} onClick={() => void onRetry?.()}>
                 {copy.retry}
@@ -328,10 +335,10 @@ export function UpdateDialog({
           <p>{copy.slowDescription}</p>
         </section>
       )}
-      {phase === "error" && updaterState.errorMessage && (
+      {phase === "error" && failureDetails && (
         <section className="cx-update-notes" role="alert">
           <strong>{copy.detailLabel}</strong>
-          <p>{updaterState.errorMessage}</p>
+          <p>{failureDetails}</p>
           {updaterState.logPath && <p className="cx-update-log-path">{copy.logLabel}: {updaterState.logPath}</p>}
         </section>
       )}

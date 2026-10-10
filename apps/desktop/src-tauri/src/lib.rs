@@ -15,6 +15,7 @@ use std::process::Command;
 
 mod app_db;
 mod app_update;
+mod app_update_channel;
 mod backups;
 mod ccswitch;
 mod config_health;
@@ -1037,6 +1038,19 @@ async fn build_provider_toml_draft(
     .map_err(|e| CodexxError::Config(format!("生成供应商 TOML 失败: {e}")))?
 }
 
+#[tauri::command]
+fn read_provider_headers(config_text: String) -> Result<Vec<providers::ProviderHeader>> {
+    providers::read_provider_headers_inner(config_text)
+}
+
+#[tauri::command]
+fn update_provider_headers(
+    config_text: String,
+    headers: Vec<providers::ProviderHeader>,
+) -> Result<String> {
+    providers::update_provider_headers_inner(config_text, headers)
+}
+
 fn save_provider_command_inner(provider: SavedProvider) -> Result<SavedProvider> {
     let saved = save_provider_inner(provider)?;
     failover::refresh_saved_routes().map_err(|error| {
@@ -1121,6 +1135,11 @@ async fn activate_saved_provider(
     provider_id: String,
 ) -> Result<ActionResult> {
     tauri::async_runtime::spawn_blocking(move || {
+        let provider = providers::list_saved_providers_inner()?
+            .into_iter()
+            .find(|provider| provider.id == provider_id)
+            .ok_or_else(|| CodexxError::Config("供应商不存在".to_string()))?;
+        failover::ensure_conversion_route(config_dir.clone(), &provider)?;
         failover::with_provider_change(config_dir.clone(), || {
             let result = providers::activate_saved_provider_inner(config_dir, provider_id.clone())?;
             Ok(finish_provider_selection(
@@ -1140,6 +1159,9 @@ async fn save_active_provider(
     apply_common_config: Option<bool>,
 ) -> Result<ActionResult> {
     tauri::async_runtime::spawn_blocking(move || {
+        let provider =
+            providers::normalize_saved_provider_for_save(&providers::open_store()?, provider)?;
+        failover::ensure_conversion_route(config_dir.clone(), &provider)?;
         let result = failover::with_provider_change(config_dir.clone(), || {
             let provider_id = provider.id.clone();
             let result = if apply_common_config.unwrap_or(false) {
@@ -1575,20 +1597,46 @@ async fn save_provider_toml_config(
 async fn test_provider_connection(
     base_url: String,
     api_key: Option<String>,
+    upstream_api: Option<String>,
+    config_text: Option<String>,
 ) -> Result<ProviderConnectionResult> {
-    tauri::async_runtime::spawn_blocking(move || test_provider_connection_inner(base_url, api_key))
-        .await
-        .map_err(|e| CodexxError::Config(format!("测试连接失败: {e}")))?
+    tauri::async_runtime::spawn_blocking(move || {
+        if upstream_api.is_none() && config_text.is_none() {
+            test_provider_connection_inner(base_url, api_key)
+        } else {
+            providers::test_provider_connection_with_protocol_inner(
+                base_url,
+                api_key,
+                upstream_api,
+                config_text,
+            )
+        }
+    })
+    .await
+    .map_err(|e| CodexxError::Config(format!("测试连接失败: {e}")))?
 }
 
 #[tauri::command]
 async fn fetch_provider_models(
     base_url: String,
     api_key: Option<String>,
+    upstream_api: Option<String>,
+    config_text: Option<String>,
 ) -> Result<ProviderModelsResult> {
-    tauri::async_runtime::spawn_blocking(move || fetch_provider_models_inner(base_url, api_key))
-        .await
-        .map_err(|e| CodexxError::Config(format!("获取模型列表失败: {e}")))?
+    tauri::async_runtime::spawn_blocking(move || {
+        if upstream_api.is_none() && config_text.is_none() {
+            fetch_provider_models_inner(base_url, api_key)
+        } else {
+            providers::fetch_provider_models_with_protocol_inner(
+                base_url,
+                api_key,
+                upstream_api,
+                config_text,
+            )
+        }
+    })
+    .await
+    .map_err(|e| CodexxError::Config(format!("获取模型列表失败: {e}")))?
 }
 
 #[tauri::command]
@@ -1811,6 +1859,7 @@ pub fn run() {
         })
         .on_window_event(desktop_lifecycle::handle_window_event)
         .invoke_handler(tauri::generate_handler![
+            app_update_channel::check_online_app_update,
             app_update::install_app_update,
             get_about_info,
             restart_codex_desktop,
@@ -1849,6 +1898,8 @@ pub fn run() {
             save_provider_order,
             get_provider_config_base,
             build_provider_toml_draft,
+            read_provider_headers,
+            update_provider_headers,
             save_provider,
             duplicate_provider,
             update_codex_context_window,

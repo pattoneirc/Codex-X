@@ -24,8 +24,9 @@ pub(crate) use ccswitch::{
 #[cfg(test)]
 pub(crate) use connection::provider_status_result;
 pub(crate) use connection::{
-    fetch_provider_models_inner, test_provider_connection_inner, ProviderConnectionResult,
-    ProviderModelsResult,
+    fetch_provider_models_inner, fetch_provider_models_with_protocol_inner,
+    test_provider_connection_inner, test_provider_connection_with_protocol_inner,
+    ProviderConnectionResult, ProviderModelsResult,
 };
 pub(crate) use live::{
     activate_saved_provider_inner, build_provider_toml_draft_inner,
@@ -62,11 +63,12 @@ pub(crate) use store::{
     get_provider_order_inner, is_placeholder_provider, list_saved_providers_inner,
     list_saved_providers_on_connection, matching_saved_provider_ids_for_live,
     matching_saved_provider_ids_for_live_on_connection, normalize_saved_provider,
-    normalize_saved_provider_for_save, provider_template_from_document, reserved_codex_provider_id,
-    rollback_provider_store_inner, save_detected_provider_with_rollback_inner, save_provider_inner,
-    save_provider_order_inner, save_provider_with_rollback_inner, strip_provider_bearer_tokens,
-    upsert_ccswitch_provider_on_connection, DuplicateProviderResult, ProviderStoreRollback,
-    ProviderUpsertKind, SavedProvider,
+    normalize_saved_provider_for_save, provider_template_from_document,
+    read_provider_headers_inner, reserved_codex_provider_id, rollback_provider_store_inner,
+    save_detected_provider_with_rollback_inner, save_provider_inner, save_provider_order_inner,
+    save_provider_with_rollback_inner, strip_provider_bearer_tokens, update_provider_headers_inner,
+    upsert_ccswitch_provider_on_connection, DuplicateProviderResult, ProviderHeader,
+    ProviderStoreRollback, ProviderUpsertKind, SavedProvider,
 };
 
 pub(crate) fn open_store() -> Result<Connection> {

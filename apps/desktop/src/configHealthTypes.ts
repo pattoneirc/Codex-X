@@ -3,6 +3,11 @@ export type ConfigHealthIssue = {
   title: string;
   description: string;
   repairable: boolean;
+  path: string;
+  line: number | null;
+  column: number | null;
+  key: string;
+  suggestion: string;
 };
 
 export type ConfigHealthReport = {

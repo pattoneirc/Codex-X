@@ -134,6 +134,7 @@ fn provider_test_connection() -> Connection {
                 wire_api TEXT NOT NULL DEFAULT 'responses',
                 requires_openai_auth INTEGER NOT NULL DEFAULT 1,
                 model_mappings_json TEXT NOT NULL DEFAULT '[]',
+                upstream_api TEXT,
                 source TEXT NOT NULL DEFAULT 'manual',
                 source_id TEXT,
                 created_at TEXT NOT NULL,
@@ -160,6 +161,7 @@ fn provider_fixture(
         api_key: api_key.map(ToString::to_string),
         toml_config: toml_config.map(ToString::to_string),
         wire_api: "responses".to_string(),
+        upstream_api: None,
         requires_openai_auth: true,
         model_mappings: Vec::new(),
     }
@@ -551,6 +553,7 @@ fn ccswitch_row_reader_supports_legacy_schema_without_category() {
         name: "OpenAI Official".to_string(),
         settings_config: "{}".to_string(),
         category: None,
+        meta: None,
     };
     assert!(is_official_ccswitch_row(&official));
 }
@@ -961,6 +964,7 @@ wire_api = "responses"
         api_key: Some("sk-same".to_string()),
         toml_config: Some(toml.to_string()),
         wire_api: "responses".to_string(),
+        upstream_api: None,
         requires_openai_auth: true,
         model_mappings: Vec::new(),
     };
@@ -1809,6 +1813,7 @@ enabled = true
             api_key: Some("sk-provider-a".to_string()),
             toml_config: Some(provider_a_config.to_string()),
             wire_api: "responses".to_string(),
+            upstream_api: None,
             requires_openai_auth: true,
             model_mappings: Vec::new(),
         },
@@ -1820,6 +1825,7 @@ enabled = true
             api_key: Some("sk-provider-b".to_string()),
             toml_config: Some(provider_b_config.to_string()),
             wire_api: "responses".to_string(),
+            upstream_api: None,
             requires_openai_auth: true,
             model_mappings: Vec::new(),
         },
@@ -2730,6 +2736,7 @@ requires_openai_auth = true
         api_key: None,
         toml_config: Some(provider_config.to_string()),
         wire_api: "responses".to_string(),
+        upstream_api: None,
         requires_openai_auth: true,
         model_mappings: Vec::new(),
     })
@@ -3198,6 +3205,7 @@ requires_openai_auth = true
         api_key: Some("sk-duplicate-current".to_string()),
         toml_config: Some(custom_config.trim_end().to_string()),
         wire_api: "responses".to_string(),
+        upstream_api: None,
         requires_openai_auth: true,
         model_mappings: Vec::new(),
     };
@@ -3656,8 +3664,11 @@ experimental_bearer_token = "sk-from-config"
         name: "Proxy".to_string(),
         settings_config,
         category: None,
+        meta: None,
     };
-    let provider = build_ccswitch_codex_provider(&row, &HashMap::new()).expect("provider");
+    let provider = build_ccswitch_codex_provider(&row, &HashMap::new())
+        .expect("valid provider")
+        .expect("provider");
     assert_eq!(provider.id, "openai-custom");
     assert_eq!(provider.api_key.as_deref(), Some("sk-from-config"));
     assert_eq!(provider.base_url, "https://proxy.example.com/v1");
@@ -3682,6 +3693,7 @@ requires_openai_auth = true
         })
         .to_string(),
         category: None,
+        meta: None,
     };
     let magic_row = CcSwitchCodexRow {
         id: "magicai-1782956845071".to_string(),
@@ -3706,6 +3718,7 @@ requires_openai_auth = true
         })
         .to_string(),
         category: None,
+        meta: None,
     };
 
     let mut sections = HashMap::new();
@@ -3718,8 +3731,12 @@ requires_openai_auth = true
         }
     }
 
-    let sky = build_ccswitch_codex_provider(&sky_row, &sections).expect("sky");
-    let magic = build_ccswitch_codex_provider(&magic_row, &sections).expect("magic");
+    let sky = build_ccswitch_codex_provider(&sky_row, &sections)
+        .expect("valid sky provider")
+        .expect("sky");
+    let magic = build_ccswitch_codex_provider(&magic_row, &sections)
+        .expect("valid magic provider")
+        .expect("magic");
 
     assert_eq!(sky.provider_name, "Sky2api");
     assert_eq!(sky.base_url, "https://ikuncode.site/v1");

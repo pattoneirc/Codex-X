@@ -1,6 +1,6 @@
 import { useSyncExternalStore } from "react";
 import { Channel, invoke } from "@tauri-apps/api/core";
-import { check as checkForTauriUpdate } from "@tauri-apps/plugin-updater";
+import { Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { AppUpdaterController, type AppUpdateEvent } from "./appUpdaterController";
 
@@ -8,7 +8,16 @@ export { INITIAL_APP_UPDATER_STATE, isAppUpdateBusy } from "./appUpdaterControll
 export type { AppUpdaterPhase, AppUpdaterState, AppUpdaterFailure, AppUpdaterCheckResult, AppUpdaterCheckOptions } from "./appUpdaterController";
 
 export const appUpdater = new AppUpdaterController({
-  check: checkForTauriUpdate,
+  check: async (options) => {
+    const metadata = await invoke<ConstructorParameters<typeof Update>[0] | null>("check_online_app_update", {
+      timeout: options.timeout,
+      headers: options.headers ? Array.from(new Headers(options.headers).entries()) : undefined,
+      proxy: options.proxy,
+      target: options.target,
+      allowDowngrades: options.allowDowngrades,
+    });
+    return metadata ? new Update(metadata) : null;
+  },
   install: async (update, onEvent, options) => {
     const channel = new Channel<AppUpdateEvent>(onEvent);
     return invoke<{ restartRequired: boolean }>("install_app_update", {

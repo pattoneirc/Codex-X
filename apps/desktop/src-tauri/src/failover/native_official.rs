@@ -182,6 +182,7 @@ pub(crate) fn route_for_current(dir: &Path) -> Result<Option<ProxyRoute>> {
         .into_iter()
         .collect::<HashSet<_>>();
     Ok(Some(ProxyRoute {
+        protocol: super::protocol::UpstreamApi::Responses,
         id: format!("official:{profile_id}"),
         name,
         base_url,

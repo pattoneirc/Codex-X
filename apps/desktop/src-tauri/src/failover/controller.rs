@@ -4,6 +4,7 @@
 
 use super::config::{self, RoutingTuning, MAX_QUEUE, ROUTE_GENERATION_HEADER, ROUTE_TOKEN_HEADER};
 use super::native_official;
+use super::protocol::UpstreamApi;
 use super::proxy::{ProxyHandle, ProxyOptions, ProxyRoute, ProxySelectionEvent, ProxySnapshot};
 use crate::error::{CodexxError, Result};
 use crate::file_io::parse_toml_document;
@@ -84,6 +85,8 @@ struct ProxyJournal {
     table_existed: bool,
     #[serde(default = "default_true")]
     providers_existed: bool,
+    #[serde(default)]
+    requires_conversion: bool,
 }
 
 #[derive(Default, Clone, Serialize, Deserialize)]
@@ -552,9 +555,8 @@ fn provider_models(provider: &SavedProvider) -> Vec<String> {
 }
 
 fn route(provider: &SavedProvider) -> Result<ProxyRoute> {
-    if provider.wire_api != "responses" {
-        return Err(CodexxError::Config("需要支持 Responses 的供应商".into()));
-    }
+    let protocol =
+        UpstreamApi::from_provider(provider.upstream_api.as_deref(), &provider.wire_api)?;
     let url = reqwest::Url::parse(provider.base_url.trim())
         .map_err(|_| CodexxError::Config("供应商地址无效".into()))?;
     if !matches!(url.scheme(), "http" | "https")
@@ -624,9 +626,6 @@ fn route(provider: &SavedProvider) -> Result<ProxyRoute> {
             );
         }
     }
-    if provider.requires_openai_auth && api_key.is_none() {
-        return Err(CodexxError::Config("请先填写该供应商的 API Key".into()));
-    }
     if let Some(key) = &api_key {
         reqwest::header::HeaderValue::from_str(&format!("Bearer {key}"))
             .map_err(|_| CodexxError::Config("供应商 API Key 格式不正确".into()))?;
@@ -643,7 +642,6 @@ fn route(provider: &SavedProvider) -> Result<ProxyRoute> {
                             | "content-length"
                             | "transfer-encoding"
                             | "cookie"
-                            | "authorization"
                             | "proxy-authorization"
                             | "origin"
                     ) {
@@ -670,7 +668,21 @@ fn route(provider: &SavedProvider) -> Result<ProxyRoute> {
             }
         }
     }
+    if provider.requires_openai_auth
+        && api_key.is_none()
+        && !headers.iter().any(|(name, _)| {
+            matches!(
+                name.to_ascii_lowercase().as_str(),
+                "authorization" | "x-api-key" | "x-goog-api-key"
+            )
+        })
+    {
+        return Err(CodexxError::Config(
+            "请先填写该供应商的 API Key 或认证请求头".into(),
+        ));
+    }
     Ok(ProxyRoute {
+        protocol,
         official: None,
         id: provider.id.clone(),
         name: provider.provider_name.clone(),
@@ -900,6 +912,7 @@ fn attach_route(dir: &Path, record: &mut Record, runtime: &mut Running) -> Resul
         official: primary.official.is_some(),
         table_existed: original.is_some(),
         providers_existed: direct.get("model_providers").is_some(),
+        requires_conversion: primary.protocol.requires_routing(),
     };
     replace_table(
         &mut direct,
@@ -1155,7 +1168,10 @@ pub(crate) fn get_status(config_dir: Option<String>) -> Result<FailoverStatus> {
     let dir = directory(config_dir)?;
     let mut runtimes = lock_manager()?;
     let mut record = load_record(&dir)?;
-    if let Some(runtime) = runtimes.get_mut(&dir) {
+    if let Some(runtime) = runtimes
+        .get_mut(&dir)
+        .filter(|_| !SHUTTING_DOWN.load(Ordering::Acquire))
+    {
         inspect_external_change(&dir, &mut record, runtime)?;
     }
     status_locked(&dir, record, runtimes.get(&dir))
@@ -1176,6 +1192,14 @@ pub(crate) fn save_settings(
     let mut old = load_record(&dir)?;
     if let Some(runtime) = runtimes.get_mut(&dir) {
         inspect_external_change(&dir, &mut old, runtime)?;
+    }
+    if (!settings.router_enabled || !settings.takeover_enabled)
+        && runtimes
+            .get(&dir)
+            .and_then(|runtime| runtime.journal.as_ref())
+            .is_some_and(|journal| journal.requires_conversion)
+    {
+        return Err(CodexxError::Config("当前供应商需要协议转换。请先切换到 Responses 供应商或官方账号，再关闭 Codex 接管或路由服务。".into()));
     }
     if let Some(runtime) = runtimes.get(&dir) {
         if settings.router_enabled
@@ -1289,27 +1313,47 @@ pub(crate) fn with_provider_change<T>(
 ) -> Result<T> {
     let dir = directory(config_dir)?;
     let mut runtimes = lock_manager()?;
+    if SHUTTING_DOWN.load(Ordering::Acquire) {
+        return Err(CodexxError::Config(
+            "Codex-X 正在退出或交接更新，未更改供应商配置".into(),
+        ));
+    }
     let mut record = load_record(&dir)?;
     let Some(runtime) = runtimes.get_mut(&dir) else {
         drop(runtimes);
-        recover_stale_route(Some(dir.display().to_string()))?;
+        // A converted stale route cannot be restored to a supplier's raw URL.
+        // The explicit provider action can replace it with a new valid route.
+        if !record
+            .journals
+            .iter()
+            .any(|journal| journal.requires_conversion)
+        {
+            recover_stale_route(Some(dir.display().to_string()))?;
+        }
         return action();
     };
     let reconnect = runtime.journal.is_some() && record.settings.takeover_enabled;
+    let checkpoint = FileCheckpoint::capture(&dir)?;
+    let old_record = record.clone();
+    let old_journal = runtime.journal.clone();
+    let old_routes = runtime.routes.clone();
+    let old_options = runtime.options.clone();
     if reconnect {
         detach_route(&dir, &record, runtime)?;
     }
     let result = action();
     if reconnect {
         if let Err(error) = attach_route(&dir, &mut record, runtime) {
-            record.settings.takeover_enabled = false;
-            record.message = Some(format!(
-                "供应商操作已结束，但重新接管失败；当前使用直连：{error}"
-            ));
-            save_record(&dir, &record)?;
+            let expected = FileCheckpoint::capture(&dir)?;
+            checkpoint.restore(&dir, &expected)?;
+            save_record(&dir, &old_record)?;
+            runtime.journal = old_journal;
+            update_runtime(runtime, old_routes, old_options)?;
             changed(&dir);
             return match result {
-                Ok(_) => Err(CodexxError::Config(record.message.unwrap())),
+                Ok(_) => Err(CodexxError::Config(format!(
+                    "供应商重新接管失败，已恢复原配置和路由：{error}"
+                ))),
                 Err(original) => Err(original),
             };
         }
@@ -1318,11 +1362,53 @@ pub(crate) fn with_provider_change<T>(
     result
 }
 
+/// Call at the IPC boundary before with_provider_change acquires the manager
+/// lock. Internal P1/failover changes already run under validated takeover.
+pub(crate) fn ensure_conversion_route(
+    config_dir: Option<String>,
+    provider: &SavedProvider,
+) -> Result<()> {
+    let conversion =
+        UpstreamApi::from_provider(provider.upstream_api.as_deref(), &provider.wire_api)?
+            .requires_routing();
+    let dir = directory(config_dir)?;
+    let runtimes = lock_manager()?;
+    let record = load_record(&dir)?;
+    if runtimes
+        .get(&dir)
+        .is_some_and(|runtime| runtime.journal.is_some())
+    {
+        route(provider)?;
+    }
+    if !conversion {
+        return Ok(());
+    }
+    if !record.settings.router_enabled
+        || !record.settings.takeover_enabled
+        || runtimes
+            .get(&dir)
+            .is_none_or(|runtime| runtime.journal.is_none())
+    {
+        return Err(CodexxError::Config(
+            "该供应商需要协议转换。请先开启路由总开关和 Codex 请求接管，再启用该供应商。".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn recover_stale_route(config_dir: Option<String>) -> Result<()> {
     let dir = directory(config_dir)?;
     let record = load_record(&dir)?;
     if dir.exists() && !record.journals.is_empty() {
         let _guard = acquire_live_config_lock(&dir)?;
+        let doc = read_document(&dir)?.1;
+        if record
+            .journals
+            .iter()
+            .any(|journal| journal.requires_conversion && owned_route(&doc, journal))
+        {
+            return Err(CodexxError::Config("当前供应商需要协议转换，不能恢复为直连。请重新启动路由服务，或切换到 Responses 供应商/官方账号。".into()));
+        }
         restore_owned_locked(&dir, &record)?;
     }
     Ok(())
@@ -1337,6 +1423,16 @@ fn refresh_routes_locked(dir: &Path, record: &mut Record, runtime: &mut Running)
     {
         Ok(()) => Ok(()),
         Err(error) => {
+            if runtime
+                .journal
+                .as_ref()
+                .is_some_and(|journal| journal.requires_conversion)
+            {
+                record.message=Some(format!("协议转换供应商配置不可用，已保留原路由；请修正配置或切换到 Responses 供应商：{error}"));
+                save_record(dir, record)?;
+                changed(dir);
+                return Ok(());
+            }
             detach_route(dir, record, runtime)?;
             record.settings.takeover_enabled = false;
             record.message = Some(format!("当前供应商配置不可用，已恢复直连：{error}"));
@@ -1348,6 +1444,11 @@ fn refresh_routes_locked(dir: &Path, record: &mut Record, runtime: &mut Running)
 }
 pub(crate) fn refresh_saved_routes() -> Result<()> {
     let mut runtimes = lock_manager()?;
+    if SHUTTING_DOWN.load(Ordering::Acquire) {
+        return Err(CodexxError::Config(
+            "Codex-X 正在退出或交接更新，未更改路由配置".into(),
+        ));
+    }
     for (dir, runtime) in runtimes.iter_mut() {
         let mut record = load_record(dir)?;
         refresh_routes_locked(dir, &mut record, runtime)?;
@@ -1370,6 +1471,9 @@ fn record_selection(
     notice: SelectionNotice,
     runtimes: &mut HashMap<PathBuf, Running>,
 ) -> Result<()> {
+    if SHUTTING_DOWN.load(Ordering::Acquire) {
+        return Ok(());
+    }
     let Some(runtime) = runtimes.get_mut(&notice.dir) else {
         return Ok(());
     };
@@ -1425,6 +1529,9 @@ fn record_selection(
     *original.as_table_mut() = table;
     let mut next = journal.clone();
     next.primary_id = provider.id.clone();
+    next.requires_conversion =
+        UpstreamApi::from_provider(provider.upstream_api.as_deref(), &provider.wire_api)?
+            .requires_routing();
     next.original_table = original.to_string();
     next.lease_id = Some(random_token()?);
     let _guard = acquire_live_config_lock(&notice.dir)?;
@@ -1506,7 +1613,16 @@ pub(crate) fn initialize() -> Result<()> {
         }
         let mut record = load_record(&dir)?;
         let desired = record.settings.takeover_enabled;
-        if !record.journals.is_empty() && dir.exists() {
+        let converted_owned = if dir.exists() {
+            let doc = read_document(&dir)?.1;
+            record
+                .journals
+                .iter()
+                .any(|journal| journal.requires_conversion && owned_route(&doc, journal))
+        } else {
+            false
+        };
+        if !converted_owned && !record.journals.is_empty() && dir.exists() {
             let _guard = acquire_live_config_lock(&dir)?;
             restore_owned_locked(&dir, &record)?;
         }
@@ -1518,6 +1634,11 @@ pub(crate) fn initialize() -> Result<()> {
         match normalized_settings(record.settings.clone()) {
             Ok(settings) => record.settings = settings,
             Err(error) => {
+                if converted_owned {
+                    record.message=Some(format!("协议转换路由无法启动，已保留本地接管配置；请检查端口或切换到 Responses 供应商：{error}"));
+                    save_record(&dir, &record)?;
+                    continue;
+                }
                 record.settings.router_enabled = false;
                 record.settings.takeover_enabled = false;
                 record.message = Some(format!("路由设置需要检查，当前使用直连：{error}"));
@@ -1548,6 +1669,11 @@ pub(crate) fn initialize() -> Result<()> {
                 saved?;
             }
             Err(error) => {
+                if converted_owned {
+                    record.message=Some(format!("协议转换路由无法启动，已保留本地接管配置；请检查端口或切换到 Responses 供应商：{error}"));
+                    save_record(&dir, &record)?;
+                    continue;
+                }
                 record.settings.router_enabled = false;
                 record.settings.takeover_enabled = false;
                 record.message = Some(format!("路由未启动，当前使用直连：{error}"));
@@ -1567,6 +1693,9 @@ fn ensure_watcher() {
                 let Ok(mut runtimes) = lock_manager() else {
                     continue;
                 };
+                if SHUTTING_DOWN.load(Ordering::Acquire) {
+                    continue;
+                }
                 let events: Vec<_> = notices()
                     .1
                     .lock()
@@ -1592,17 +1721,82 @@ fn ensure_watcher() {
         });
     });
 }
+fn shutdown_allowed_locked(runtimes: &HashMap<PathBuf, Running>) -> Result<()> {
+    for (dir, runtime) in runtimes {
+        let Some(journal) = runtime.journal.as_ref() else {
+            continue;
+        };
+        let doc = read_document(dir)?.1;
+        if journal.requires_conversion && owned_route(&doc, journal) {
+            let record = load_record(dir)?;
+            let persisted=record.journals.iter().find(|saved| saved.requires_conversion && saved.primary_id==journal.primary_id && saved.provider_key==journal.provider_key && saved.token==journal.token && saved.lease_id==journal.lease_id && owned_route(&doc,saved))
+                .ok_or_else(||CodexxError::Config("转换路由的恢复记录缺失，服务继续运行；请重新启用 Codex 接管后重试退出或更新。".into()))?;
+            original_table(persisted)?;
+        } else if !journal.requires_conversion {
+            // Validate the existing native restore projection without writing.
+            restored_document(&doc, journal)?;
+        }
+    }
+    Ok(())
+}
+
+/// Read-only check for exit/update callers before they modify the application.
+pub(crate) fn ensure_shutdown_allowed() -> Result<()> {
+    let runtimes = lock_manager()?;
+    shutdown_allowed_locked(&runtimes)
+}
+
+/// Freeze configuration mutations during an update while keeping active
+/// requests and the listener alive until the installer needs the process exit.
+pub(crate) fn begin_update_handoff() -> Result<()> {
+    let runtimes = lock_manager()?;
+    shutdown_allowed_locked(&runtimes)?;
+    SHUTTING_DOWN.store(true, Ordering::Release);
+    Ok(())
+}
+
 pub(crate) fn shutdown_all() -> Result<()> {
     SHUTTING_DOWN.store(true, Ordering::Release);
     let result = (|| -> Result<()> {
         let mut runtimes = lock_manager()?;
+        shutdown_allowed_locked(&runtimes)?;
         let dirs: Vec<_> = runtimes.keys().cloned().collect();
         for dir in dirs {
-            let record = load_record(&dir)?;
+            let mut record = load_record(&dir)?;
             if let Some(runtime) = runtimes.get_mut(&dir) {
-                detach_route(&dir, &record, runtime)?;
+                if let Some(journal) = runtime
+                    .journal
+                    .as_ref()
+                    .filter(|journal| journal.requires_conversion)
+                {
+                    let previous_settings = record.settings.clone();
+                    let previous_message = record.message.clone();
+                    let doc = read_document(&dir)?.1;
+                    if !selected_owned_route(&doc, journal) {
+                        // An explicit external selection is kept exactly as it
+                        // is; the next launch must not take it over implicitly.
+                        record.settings.takeover_enabled = false;
+                        record.message = Some(
+                            "退出时检测到外部供应商配置，已原样保留；下次启动不会自动接管该配置。"
+                                .into(),
+                        );
+                    } else {
+                        record.settings.router_enabled = true;
+                        record.settings.takeover_enabled = true;
+                        record.settings.listen_address = runtime.proxy.listen_address().to_string();
+                        record.settings.listen_port = runtime.proxy.port();
+                    }
+                    if record.settings != previous_settings || record.message != previous_message {
+                        save_record(&dir, &record)?;
+                    }
+                    // Keep the owned loopback overlay and recovery journal.
+                    // initialize reconnects it on the next app launch. Restoring
+                    // this supplier's raw URL would send an invalid /responses.
+                } else {
+                    detach_route(&dir, &record, runtime)?;
+                }
             }
-            // Keep desired settings for next launch; restore first, stop last.
+            // All required writes/validation finish before stopping a listener.
             if let Some(runtime) = runtimes.remove(&dir) {
                 runtime.proxy.shutdown();
             }
@@ -1617,7 +1811,6 @@ pub(crate) fn shutdown_all() -> Result<()> {
 
 /// Only an update handoff that has not launched an installer may resume the
 /// saved routes. A successful handoff keeps the shutdown gate closed until exit.
-#[cfg(any(test, target_os = "windows"))]
 pub(crate) fn resume_after_failed_update() -> Result<()> {
     SHUTTING_DOWN.store(false, Ordering::Release);
     let expected: Vec<_> = stored_directories()?

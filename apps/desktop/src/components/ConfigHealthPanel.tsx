@@ -1,6 +1,7 @@
 import { useId } from "react";
 import { AlertTriangle, CheckCircle2, FileSearch, FolderOpen, Loader2, RefreshCw, Wrench } from "lucide-react";
-import type { ConfigHealthReport } from "../configHealthTypes";
+import { configHealthIssueLocation, configHealthRepairUnavailableReason } from "../configHealthPresentation";
+import type { ConfigHealthIssue, ConfigHealthReport } from "../configHealthTypes";
 import { Button } from "./ui";
 import "../styles/config-health.css";
 
@@ -14,6 +15,15 @@ export type ConfigHealthPanelProps = {
   onRepair: () => void;
   onOpenConfig?: () => void;
 };
+
+export function ConfigHealthIssueDetails({ issue, report, lang }: { issue: ConfigHealthIssue; report: ConfigHealthReport; lang: "zh" | "en" }) {
+  const location = configHealthIssueLocation(issue, report, lang);
+  return <>
+    <p className="cx-config-health-location"><code>{location.path}</code><span>{location.position}</span></p>
+    <p className="cx-config-health-key">{lang === "zh" ? "参数：" : "Setting: "}<code>{location.key}</code></p>
+    {issue.suggestion && <p className="cx-config-health-suggestion">{lang === "zh" ? "修复建议：" : "Suggested fix: "}{issue.suggestion}</p>}
+  </>;
+}
 
 export function ConfigHealthStatus({ lang, report, checking, repairing, error }: Pick<ConfigHealthPanelProps, "lang" | "report" | "checking" | "repairing" | "error">) {
   const zh = lang === "zh";
@@ -60,14 +70,14 @@ export function ConfigHealthPanel({ lang, report, checking, repairing, error, on
       <ul className="cx-config-health-issues">
         {report.issues.map((issue, index) => <li key={`${issue.code}-${index}`}>
           <AlertTriangle size={15} aria-hidden="true" />
-          <div><strong>{issue.title}</strong><p>{issue.description}</p></div>
+          <div><strong>{issue.title}</strong><p>{issue.description}</p><ConfigHealthIssueDetails issue={issue} report={report} lang={lang} /></div>
         </li>)}
       </ul>
       {report.canRepair && report.repairSummary.length > 0 && <div className="cx-config-health-plan">
         <strong>{zh ? "点击修复后，将进行以下调整：" : "Repair will make these changes:"}</strong>
         <ul>{report.repairSummary.map((summary, index) => <li key={index}>{summary}</li>)}</ul>
       </div>}
-      {manualIssues && <p className="cx-config-health-note">{zh ? "部分问题需要手动检查。为保留你的配置，软件不会猜测或覆盖无法确认的内容。" : "Some issues need a manual check. Settings that cannot be determined safely will be left for you to review."}</p>}
+      {manualIssues && <p className="cx-config-health-note">{zh ? "请按每项问题的文件位置与修复建议处理需要手动确认的参数，然后重新检查。" : "Use each issue’s file location and suggested fix to review settings that need manual confirmation, then check again."}</p>}
     </div>}
 
     {report?.status === "missing" && <p className="cx-config-health-note">{zh ? "还没有找到配置文件。完成 Codex 登录或启用供应商后，可以再次检查。" : "No configuration file was found. Check again after signing in to Codex or enabling a provider."}</p>}
@@ -80,6 +90,7 @@ export function ConfigHealthPanel({ lang, report, checking, repairing, error, on
       <div className="cx-config-health-actions">
         {onOpenConfig && (hasIssues || report?.status === "unavailable") && <Button variant="ghost" size="sm" icon={<FolderOpen size={15} />} disabled={busy} onClick={onOpenConfig}>{zh ? "查看配置" : "View configuration"}</Button>}
         <Button variant="secondary" size="sm" icon={checking ? <Loader2 size={15} className="cx-config-health-spinner" /> : <RefreshCw size={15} />} disabled={busy} onClick={onCheck}>{checking ? (zh ? "检查中" : "Checking") : (zh ? "检查配置" : "Check configuration")}</Button>
+        {hasIssues && !report.canRepair && <Button variant="secondary" size="sm" icon={<Wrench size={15} />} disabled title={configHealthRepairUnavailableReason(report, lang)}>{zh ? "需手动修复" : "Manual repair needed"}</Button>}
         {report?.canRepair && hasIssues && <Button size="sm" icon={repairing ? <Loader2 size={15} className="cx-config-health-spinner" /> : <Wrench size={15} />} disabled={busy} onClick={onRepair}>{repairing ? (zh ? "修复中" : "Repairing") : (zh ? "修复配置" : "Repair configuration")}</Button>}
       </div>
     </div>

@@ -155,14 +155,17 @@ export function useConfigHealth(options: {
       dismiss(); accept(result.report);
       if (result.report.status === "healthy") registry.current?.clear(result.report);
       const zh = runtime.current.lang === "zh";
+      const remaining = result.report.issues[0];
       runtime.current.onHint(result.report.status === "healthy"
         ? (zh ? "配置已检查并修复，请重新打开原来的 Codex 对话。" : "Configuration checked and repaired. Reopen the Codex conversation.")
-        : (zh ? "可自动处理的部分已修复，其余问题可在通用设置中查看。" : "Supported repairs are complete. Review the remaining issues in General settings."));
+        : remaining
+          ? `${zh ? "已完成安全修复；仍需处理：" : "Supported repairs are complete; review: "}${remaining.path || `${result.report.codexDir}/config.toml`}${remaining.line ? `:${remaining.line}:${remaining.column || 1}` : ""} · ${remaining.key || remaining.title}。${remaining.suggestion || remaining.description}`
+          : (zh ? "请在通用设置中查看检查结果。" : "Review the check result in General settings."));
       runtime.current.onRepaired();
     } catch (cause) {
       if (current()) {
         dismiss(); setError(String(cause));
-        runtime.current.onHint(runtime.current.lang === "zh" ? "配置未修复，请到「设置 → 通用设置」查看原因或重新检查。" : "Configuration was not repaired. Review the issue or check again in Settings → General.");
+        runtime.current.onHint(`${runtime.current.lang === "zh" ? "配置未修复：" : "Configuration was not repaired: "}${String(cause)}`);
       }
     } finally { if (current()) { busyRef.current = false; setRepairing(false); } }
   }, [accept, dismiss]);

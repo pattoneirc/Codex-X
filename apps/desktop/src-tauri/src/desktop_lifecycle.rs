@@ -141,6 +141,13 @@ pub(crate) fn report_failover_lifecycle_error(app: &tauri::AppHandle, title: &st
 
 pub(crate) fn handle_run_event(app: &tauri::AppHandle, event: tauri::RunEvent) {
     if let tauri::RunEvent::ExitRequested { api, .. } = &event {
+        if crate::app_update::defer_exit_during_installation() {
+            // The installed bundle or updater handoff is being changed. A
+            // normal Quit must not interrupt it; Windows marks its authorized
+            // handoff before requesting process exit.
+            api.prevent_exit();
+            return;
+        }
         if let Err(error) = crate::failover::shutdown_all() {
             // Keep the listener alive when restoring the direct route failed.
             // Exiting here would strand Codex on a local address with no server.
@@ -149,7 +156,9 @@ pub(crate) fn handle_run_event(app: &tauri::AppHandle, event: tauri::RunEvent) {
             report_failover_lifecycle_error(
                 app,
                 "暂时无法退出 Codex-X",
-                &format!("自动切换的连接配置还未恢复，Codex-X 将继续运行。\n\n{error}\n\n请检查配置文件是否被占用，再重试退出。"),
+                &format!(
+                    "路由仍需保持可用，Codex-X 将继续运行。\n\n{error}\n\n请按提示处理后再退出。"
+                ),
             );
         }
     }

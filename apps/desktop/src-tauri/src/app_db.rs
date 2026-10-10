@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-const APP_DB_SCHEMA_VERSION: i64 = 8;
+const APP_DB_SCHEMA_VERSION: i64 = 9;
 
 struct DatabaseInitializer {
     migration_lock: Mutex<()>,
@@ -149,6 +149,7 @@ fn initialize_schema(conn: &Connection) -> Result<()> {
             wire_api TEXT NOT NULL DEFAULT 'responses',
             requires_openai_auth INTEGER NOT NULL DEFAULT 1,
             model_mappings_json TEXT NOT NULL DEFAULT '[]',
+            upstream_api TEXT,
             source TEXT NOT NULL DEFAULT 'manual',
             source_id TEXT,
             created_at TEXT NOT NULL,
@@ -259,6 +260,12 @@ fn initialize_schema(conn: &Connection) -> Result<()> {
         "providers",
         "model_mappings_json",
         "ALTER TABLE providers ADD COLUMN model_mappings_json TEXT NOT NULL DEFAULT '[]'",
+    )?;
+    ensure_sqlite_column(
+        conn,
+        "providers",
+        "upstream_api",
+        "ALTER TABLE providers ADD COLUMN upstream_api TEXT",
     )?;
     conn.execute_batch(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_providers_source_identity
@@ -496,6 +503,120 @@ mod tests {
             0
         );
         drop(migrated);
+        remove_test_db(&path);
+    }
+
+    #[test]
+    fn version_eight_migration_keeps_provider_data_and_defaults_upstream_api_to_null() {
+        let path = test_db_path("provider-upstream-api-v9");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let legacy = Connection::open(&path).unwrap();
+        legacy
+            .execute_batch(
+                "CREATE TABLE providers (
+                id TEXT PRIMARY KEY,
+                provider_name TEXT NOT NULL,
+                base_url TEXT NOT NULL,
+                model TEXT NOT NULL,
+                api_key TEXT,
+                toml_config TEXT,
+                wire_api TEXT NOT NULL DEFAULT 'responses',
+                requires_openai_auth INTEGER NOT NULL DEFAULT 1,
+                model_mappings_json TEXT NOT NULL DEFAULT '[]',
+                source TEXT NOT NULL DEFAULT 'manual',
+                source_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            INSERT INTO providers
+                (id, provider_name, base_url, model, api_key, toml_config, wire_api,
+                 requires_openai_auth, model_mappings_json, source, source_id,
+                 created_at, updated_at)
+            VALUES
+                ('legacy-responses', 'Existing Responses provider', 'https://responses.fixture/v1',
+                 'existing-model', 'fixture-secret', 'model_provider = \"custom\"', 'responses',
+                 1, '[{\"displayName\":\"Mapped model\",\"model\":\"upstream-model\"}]',
+                 'cc-switch', 'fixture-source-row', 'original-created', 'original-updated'),
+                ('legacy-chat', 'Existing Chat provider', 'https://chat.fixture/v1',
+                 'chat-model', NULL, NULL, 'chat',
+                 0, '[]', 'manual', NULL, 'chat-created', 'chat-updated');
+            PRAGMA user_version = 8;",
+            )
+            .unwrap();
+        assert_eq!(schema_version(&legacy).unwrap(), 8);
+        assert!(!table_column_set(&legacy, "providers")
+            .unwrap()
+            .contains("upstream_api"));
+        let snapshot = |conn: &Connection| {
+            let mut statement = conn
+                .prepare(
+                    "SELECT id, provider_name, base_url, model, api_key, toml_config,
+                        wire_api, requires_openai_auth, model_mappings_json,
+                        source, source_id, created_at, updated_at
+                 FROM providers ORDER BY id",
+                )
+                .unwrap();
+            let rows = statement
+                .query_map([], |row| {
+                    (0..13)
+                        .map(|index| row.get::<_, rusqlite::types::Value>(index))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap();
+            rows.collect::<rusqlite::Result<Vec<_>>>().unwrap()
+        };
+        let before = snapshot(&legacy);
+        drop(legacy);
+
+        let initializer = DatabaseInitializer::new();
+        let migrated = initializer.open_at(&path).unwrap();
+        assert_eq!(schema_version(&migrated).unwrap(), 9);
+        assert!(table_column_set(&migrated, "providers")
+            .unwrap()
+            .contains("upstream_api"));
+        assert_eq!(
+            snapshot(&migrated),
+            before,
+            "all pre-existing provider columns must survive migration unchanged"
+        );
+        let upstream_values = migrated
+            .prepare("SELECT upstream_api FROM providers ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get::<_, Option<String>>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(upstream_values, vec![None, None]);
+        let providers = crate::providers::list_saved_providers_on_connection(&migrated).unwrap();
+        assert_eq!(providers.len(), 2);
+        let responses = providers
+            .iter()
+            .find(|provider| provider.id == "legacy-responses")
+            .unwrap();
+        assert!(responses.upstream_api.is_none());
+        assert_eq!(responses.api_key.as_deref(), Some("fixture-secret"));
+        assert_eq!(responses.model_mappings.len(), 1);
+        assert_eq!(responses.model_mappings[0].model, "upstream-model");
+        drop(migrated);
+
+        let reopened = DatabaseInitializer::new().open_at(&path).unwrap();
+        assert_eq!(schema_version(&reopened).unwrap(), 9);
+        assert_eq!(
+            snapshot(&reopened),
+            before,
+            "reopening must leave migrated provider data unchanged"
+        );
+        assert_eq!(
+            reopened
+                .query_row(
+                    "SELECT COUNT(*) FROM providers WHERE upstream_api IS NULL",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            2
+        );
+        drop(reopened);
         remove_test_db(&path);
     }
 

@@ -1,4 +1,6 @@
 import { AlertTriangle, ArrowRight, Loader2, Wrench, X } from "lucide-react";
+import { primaryConfigHealthIssue } from "../configHealthPresentation";
+import { ConfigHealthIssueDetails } from "./ConfigHealthPanel";
 import type { ConfigHealthReport } from "../configHealthTypes";
 import { Button } from "./ui";
 import "../styles/config-health.css";
@@ -15,12 +17,14 @@ export type ConfigHealthToastProps = {
 /** The caller owns notification lifetime; CSS never dismisses this toast. */
 export function ConfigHealthToast({ lang, report, repairing, onRepair, onDismiss, onOpenSettings }: ConfigHealthToastProps) {
   const zh = lang === "zh";
+  const issue = primaryConfigHealthIssue(report);
   return <aside className="cx-config-health-toast" aria-label={zh ? "配置检查提醒" : "Configuration check notification"}>
     <span className="cx-config-health-toast-icon" aria-hidden="true"><AlertTriangle size={20} /></span>
     <div className="cx-config-health-toast-content">
       <div role="status" aria-live="polite" aria-atomic="true">
         <strong>{repairing ? (zh ? "正在修复 Codex 配置" : "Repairing Codex configuration") : (zh ? "检测到 Codex 配置问题" : "Codex configuration needs attention")}</strong>
-        <p>{(report.canRepair ? report.issues[0]?.title : report.issues[0]?.description) || (zh ? "部分配置可能影响 Codex 正常使用。" : "Some settings may prevent Codex from working correctly.")}</p>
+        <p>{(report.canRepair ? issue?.title : issue?.description) || (zh ? "部分配置可能影响 Codex 正常使用。" : "Some settings may prevent Codex from working correctly.")}</p>
+        {issue && <ConfigHealthIssueDetails issue={issue} report={report} lang={lang} />}
         {report.canRepair && report.repairSummary[0] && <p className="cx-config-health-toast-plan">{report.repairSummary[0]}</p>}
       </div>
       <div className="cx-config-health-toast-actions">

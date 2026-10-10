@@ -1,12 +1,15 @@
 use crate::error::{CodexxError, Result};
+use crate::failover::protocol::UpstreamApi;
 #[cfg(test)]
 use crate::remote::ensure_crypto_provider;
 use crate::remote::{remote_client, remote_request_error, RemoteSource};
 use reqwest::blocking::Client;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::time::Instant;
+use toml_edit::{DocumentMut, Item};
 
 const MODELS_SOURCE_KEY: &str = "获取模型列表";
 
@@ -46,18 +49,31 @@ struct ModelPayload {
     created: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Deserialize)]
+struct GeminiModelsPayload {
+    models: Vec<GeminiModelPayload>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GeminiModelPayload {
+    name: String,
+    #[serde(default)]
+    supported_generation_methods: Vec<String>,
+}
+
 enum ProviderModelsAttempt {
     Success(ProviderModelsResult),
     HttpError { status: u16, duration_ms: u128 },
 }
 
-fn provider_models_url(base_url: &str) -> Result<reqwest::Url> {
+fn provider_base_url(base_url: &str) -> Result<reqwest::Url> {
     let trimmed = base_url.trim();
     if trimmed.is_empty() {
         return Err(CodexxError::Config("base_url 不能为空".to_string()));
     }
 
-    let mut url = reqwest::Url::parse(trimmed)
+    let url = reqwest::Url::parse(trimmed)
         .map_err(|_| CodexxError::Config("base_url 格式不正确".to_string()))?;
     if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
         return Err(CodexxError::Config(
@@ -65,6 +81,11 @@ fn provider_models_url(base_url: &str) -> Result<reqwest::Url> {
         ));
     }
 
+    Ok(url)
+}
+
+fn provider_models_url(base_url: &str) -> Result<reqwest::Url> {
+    let mut url = provider_base_url(base_url)?;
     let segments = url
         .path_segments()
         .ok_or_else(|| CodexxError::Config("base_url 格式不正确".to_string()))?
@@ -91,6 +112,97 @@ fn provider_models_url(base_url: &str) -> Result<reqwest::Url> {
     }
     url.set_fragment(None);
     Ok(url)
+}
+
+fn provider_models_url_with_protocol(
+    base_url: &str,
+    protocol: UpstreamApi,
+) -> Result<reqwest::Url> {
+    if protocol != UpstreamApi::Gemini {
+        let mut url = provider_base_url(base_url)?;
+        let path = url.path().trim_end_matches('/');
+        let suffix = match protocol {
+            UpstreamApi::Responses => "/responses",
+            UpstreamApi::ChatCompletions => "/chat/completions",
+            UpstreamApi::AnthropicMessages => "/messages",
+            UpstreamApi::Gemini => unreachable!(),
+        };
+        if let Some(prefix) = path.strip_suffix(suffix) {
+            let prefix = prefix.to_string();
+            url.set_path(&prefix);
+        }
+        return provider_models_url(url.as_str());
+    }
+    let mut url = provider_base_url(base_url)?;
+    let path = url.path().trim_end_matches('/');
+    // A pasted generateContent endpoint still points to the same API prefix.
+    let prefix = path
+        .split_once("/models/")
+        .map_or(path, |(prefix, _)| prefix);
+    let path = if prefix.ends_with("/models") {
+        prefix.to_string()
+    } else if prefix.ends_with("/v1") || prefix.ends_with("/v1beta") {
+        format!("{prefix}/models")
+    } else {
+        format!("{prefix}/v1beta/models")
+    };
+    url.set_path(&path);
+    url.set_fragment(None);
+    Ok(url)
+}
+
+fn provider_models_headers_with_env(
+    config_text: Option<&str>,
+    resolve_env: impl Fn(&str) -> Option<String>,
+) -> Result<HeaderMap> {
+    let Some(config_text) = config_text.filter(|text| !text.trim().is_empty()) else {
+        return Ok(HeaderMap::new());
+    };
+    let doc = config_text
+        .parse::<DocumentMut>()
+        .map_err(|_| CodexxError::Config("供应商 TOML 无效，请先修正配置".into()))?;
+    let id = doc
+        .get("model_provider")
+        .and_then(Item::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| CodexxError::Config("供应商 TOML 缺少 model_provider".into()))?;
+    let table = doc
+        .get("model_providers")
+        .and_then(Item::as_table)
+        .and_then(|providers| providers.get(id))
+        .and_then(Item::as_table)
+        .ok_or_else(|| CodexxError::Config("供应商 TOML 缺少当前供应商配置表".into()))?;
+    super::store::validate_provider_header_table(table)?;
+    let mut headers = HeaderMap::new();
+    for header in super::store::read_provider_headers_inner(config_text.to_string())? {
+        let text = match header.source {
+            super::store::ProviderHeaderSource::Static => header.value,
+            super::store::ProviderHeaderSource::Env => {
+                resolve_env(&header.value).ok_or_else(|| {
+                    CodexxError::Config(format!(
+                        "供应商 Header ({}) 所需的环境变量不可用",
+                        header.name
+                    ))
+                })?
+            }
+        };
+        let name = HeaderName::from_bytes(header.name.as_bytes())
+            .map_err(|_| CodexxError::Config("供应商 Header 名称无效".into()))?;
+        let mut value = HeaderValue::from_str(&text).map_err(|_| {
+            CodexxError::Config(format!(
+                "供应商 Header ({}) 值无效，不能包含换行或控制字符",
+                header.name
+            ))
+        })?;
+        value.set_sensitive(true);
+        headers.insert(name, value);
+    }
+    Ok(headers)
+}
+
+fn provider_models_headers(config_text: Option<&str>) -> Result<HeaderMap> {
+    provider_models_headers_with_env(config_text, |name| std::env::var(name).ok())
 }
 
 fn parse_created(value: Option<serde_json::Value>) -> Option<i64> {
@@ -158,10 +270,42 @@ fn natural_model_id_cmp(left: &str, right: &str) -> Ordering {
 fn parse_models(body: &str) -> Result<Vec<ProviderModel>> {
     let payload: ModelsPayload = serde_json::from_str(body)
         .map_err(|_| CodexxError::Config("模型列表返回格式不正确".to_string()))?;
+    Ok(normalize_models(payload.data))
+}
+
+fn parse_models_with_protocol(body: &str, protocol: UpstreamApi) -> Result<Vec<ProviderModel>> {
+    if protocol != UpstreamApi::Gemini {
+        return parse_models(body);
+    }
+    let payload: GeminiModelsPayload = serde_json::from_str(body)
+        .map_err(|_| CodexxError::Config("模型列表返回格式不正确".to_string()))?;
+    let models = payload
+        .models
+        .into_iter()
+        .filter(|model| {
+            model
+                .supported_generation_methods
+                .iter()
+                .any(|method| method == "generateContent")
+        })
+        .map(|model| ModelPayload {
+            id: model
+                .name
+                .trim()
+                .strip_prefix("models/")
+                .unwrap_or(model.name.trim())
+                .to_string(),
+            created: None,
+        })
+        .collect();
+    Ok(normalize_models(models))
+}
+
+fn normalize_models(payload: Vec<ModelPayload>) -> Vec<ProviderModel> {
     let mut models = Vec::<ProviderModel>::new();
     let mut indexes = HashMap::<String, usize>::new();
 
-    for model in payload.data {
+    for model in payload {
         let id = model.id.trim();
         if id.is_empty() {
             continue;
@@ -187,22 +331,70 @@ fn parse_models(body: &str) -> Result<Vec<ProviderModel>> {
             .then_with(|| natural_model_id_cmp(&right.id, &left.id))
     });
 
-    Ok(models)
+    models
 }
 
+#[cfg(test)]
 fn request_provider_models_with_client(
     client: &Client,
     base_url: &str,
     api_key: Option<&str>,
 ) -> Result<ProviderModelsAttempt> {
-    let url = provider_models_url(base_url)?;
+    request_provider_models_with_protocol_client(
+        client,
+        base_url,
+        api_key,
+        UpstreamApi::Responses,
+        None,
+    )
+}
+
+fn request_provider_models_with_protocol_client(
+    client: &Client,
+    base_url: &str,
+    api_key: Option<&str>,
+    protocol: UpstreamApi,
+    config_text: Option<&str>,
+) -> Result<ProviderModelsAttempt> {
+    let headers = provider_models_headers(config_text)?;
+    request_provider_models_with_headers(client, base_url, api_key, protocol, headers)
+}
+
+fn request_provider_models_with_headers(
+    client: &Client,
+    base_url: &str,
+    api_key: Option<&str>,
+    protocol: UpstreamApi,
+    headers: HeaderMap,
+) -> Result<ProviderModelsAttempt> {
+    let url = provider_models_url_with_protocol(base_url, protocol)?;
     let source = RemoteSource::new(MODELS_SOURCE_KEY, url.as_str(), Some("application/json"));
     let mut request = client
         .get(url.as_str())
         .header(reqwest::header::ACCEPT, "application/json");
-    if let Some(api_key) = api_key.map(str::trim).filter(|key| !key.is_empty()) {
-        request = request.bearer_auth(api_key);
+    if protocol == UpstreamApi::AnthropicMessages {
+        request = request.header("anthropic-version", "2023-06-01");
     }
+    let custom_auth = ["authorization", "x-api-key", "x-goog-api-key"]
+        .iter()
+        .any(|name| headers.contains_key(*name));
+    if let Some(api_key) = api_key
+        .map(str::trim)
+        .filter(|key| !key.is_empty() && !custom_auth)
+    {
+        let (name, text) = match protocol {
+            UpstreamApi::Responses | UpstreamApi::ChatCompletions => {
+                ("authorization", format!("Bearer {api_key}"))
+            }
+            UpstreamApi::AnthropicMessages => ("x-api-key", api_key.to_string()),
+            UpstreamApi::Gemini => ("x-goog-api-key", api_key.to_string()),
+        };
+        let mut value = HeaderValue::from_str(&text)
+            .map_err(|_| CodexxError::Config("供应商 API Key 格式不正确".into()))?;
+        value.set_sensitive(true);
+        request = request.header(name, value);
+    }
+    request = request.headers(headers);
 
     let started = Instant::now();
     let response = request
@@ -221,15 +413,21 @@ fn request_provider_models_with_client(
         .text()
         .map_err(|_| CodexxError::Config("模型列表读取失败".to_string()))?;
     Ok(ProviderModelsAttempt::Success(ProviderModelsResult {
-        models: parse_models(&body)?,
+        models: parse_models_with_protocol(&body, protocol)?,
         status,
         duration_ms,
     }))
 }
 
-fn request_provider_models(base_url: &str, api_key: Option<&str>) -> Result<ProviderModelsAttempt> {
+fn request_provider_models_with_protocol(
+    base_url: &str,
+    api_key: Option<&str>,
+    upstream_api: Option<&str>,
+    config_text: Option<&str>,
+) -> Result<ProviderModelsAttempt> {
+    let protocol = UpstreamApi::from_provider(upstream_api, "responses")?;
     let client = remote_client()?;
-    request_provider_models_with_client(&client, base_url, api_key)
+    request_provider_models_with_protocol_client(&client, base_url, api_key, protocol, config_text)
 }
 
 pub(crate) fn provider_status_result(status: u16, duration_ms: u128) -> ProviderConnectionResult {
@@ -251,7 +449,21 @@ pub(crate) fn test_provider_connection_inner(
     base_url: String,
     api_key: Option<String>,
 ) -> Result<ProviderConnectionResult> {
-    match request_provider_models(&base_url, api_key.as_deref())? {
+    test_provider_connection_with_protocol_inner(base_url, api_key, None, None)
+}
+
+pub(crate) fn test_provider_connection_with_protocol_inner(
+    base_url: String,
+    api_key: Option<String>,
+    upstream_api: Option<String>,
+    config_text: Option<String>,
+) -> Result<ProviderConnectionResult> {
+    match request_provider_models_with_protocol(
+        &base_url,
+        api_key.as_deref(),
+        upstream_api.as_deref(),
+        config_text.as_deref(),
+    )? {
         ProviderModelsAttempt::Success(result) => {
             Ok(provider_status_result(result.status, result.duration_ms))
         }
@@ -266,7 +478,21 @@ pub(crate) fn fetch_provider_models_inner(
     base_url: String,
     api_key: Option<String>,
 ) -> Result<ProviderModelsResult> {
-    match request_provider_models(&base_url, api_key.as_deref())? {
+    fetch_provider_models_with_protocol_inner(base_url, api_key, None, None)
+}
+
+pub(crate) fn fetch_provider_models_with_protocol_inner(
+    base_url: String,
+    api_key: Option<String>,
+    upstream_api: Option<String>,
+    config_text: Option<String>,
+) -> Result<ProviderModelsResult> {
+    match request_provider_models_with_protocol(
+        &base_url,
+        api_key.as_deref(),
+        upstream_api.as_deref(),
+        config_text.as_deref(),
+    )? {
         ProviderModelsAttempt::Success(result) => Ok(result),
         ProviderModelsAttempt::HttpError { status, .. } => {
             Err(CodexxError::Config(if matches!(status, 401 | 403) {
@@ -433,5 +659,205 @@ mod tests {
         assert!(!message.contains("sk-private-test"));
         assert!(!message.contains(&base_url));
         server.join().expect("join mock server");
+    }
+
+    #[test]
+    fn protocol_model_urls_preserve_api_prefix_and_do_not_repeat_versions() {
+        for (protocol, base, expected) in [
+            (UpstreamApi::Responses, "https://example.test/v1/responses", "https://example.test/v1/models"),
+            (UpstreamApi::ChatCompletions, "https://example.test/v1/chat/completions", "https://example.test/v1/models"),
+            (UpstreamApi::AnthropicMessages, "https://example.test", "https://example.test/v1/models"),
+            (UpstreamApi::AnthropicMessages, "https://example.test/anthropic/v1/messages", "https://example.test/anthropic/v1/models"),
+            (UpstreamApi::Gemini, "https://example.test", "https://example.test/v1beta/models"),
+            (UpstreamApi::Gemini, "https://example.test/v1beta", "https://example.test/v1beta/models"),
+            (UpstreamApi::Gemini, "https://example.test/v1beta/", "https://example.test/v1beta/models"),
+            (UpstreamApi::Gemini, "https://example.test/v1", "https://example.test/v1/models"),
+            (UpstreamApi::Gemini, "https://example.test/api/google/v1/models", "https://example.test/api/google/v1/models"),
+            (UpstreamApi::Gemini, "https://example.test/api/google/v1beta/models/gemini-2.5-pro:generateContent?route=fixture#ignored", "https://example.test/api/google/v1beta/models?route=fixture"),
+            (UpstreamApi::Gemini, "https://example.test/api/google", "https://example.test/api/google/v1beta/models"),
+        ] {
+            assert_eq!(provider_models_url_with_protocol(base, protocol).unwrap().as_str(), expected);
+        }
+    }
+
+    #[test]
+    fn chat_and_anthropic_models_use_their_protocol_authentication() {
+        for (protocol, auth) in [
+            (
+                UpstreamApi::ChatCompletions,
+                "authorization: bearer fixture-protocol-key",
+            ),
+            (
+                UpstreamApi::AnthropicMessages,
+                "x-api-key: fixture-protocol-key",
+            ),
+        ] {
+            let (url, server) = serve_once(200, r#"{"data":[{"id":"fixture-model"}]}"#);
+            let attempt = request_provider_models_with_protocol_client(
+                &direct_client(),
+                &url,
+                Some("fixture-protocol-key"),
+                protocol,
+                None,
+            )
+            .unwrap();
+            let ProviderModelsAttempt::Success(result) = attempt else {
+                panic!("expected model list")
+            };
+            assert_eq!(result.models[0].id, "fixture-model");
+            let request = server.join().unwrap().to_ascii_lowercase();
+            assert!(request.starts_with("get /v1/models http/1.1"));
+            assert!(request.contains(auth));
+            if protocol == UpstreamApi::AnthropicMessages {
+                assert!(request.contains("anthropic-version: 2023-06-01"));
+                assert!(!request.contains("authorization:"));
+            } else {
+                assert!(!request.contains("x-api-key:"));
+            }
+            assert!(!request.contains("x-goog-api-key:"));
+        }
+    }
+
+    #[test]
+    fn gemini_models_use_google_header_and_include_only_generate_content_models() {
+        let body = r#"{"models":[{"name":"models/gemini-2.5-pro","supportedGenerationMethods":["generateContent","countTokens"]},{"name":"models/text-embedding-004","supportedGenerationMethods":["embedContent"]},{"name":" models/gemini-2.5-flash ","supportedGenerationMethods":["generateContent"]},{"name":"models/gemini-2.5-pro","supportedGenerationMethods":["generateContent"]},{"name":"models/count-only","supportedGenerationMethods":["countTokens"]}]}"#;
+        let (url, server) = serve_once(200, body);
+        let attempt = request_provider_models_with_protocol_client(
+            &direct_client(),
+            &format!("{url}/v1beta"),
+            Some("fixture-google-key"),
+            UpstreamApi::Gemini,
+            None,
+        )
+        .unwrap();
+        let ProviderModelsAttempt::Success(result) = attempt else {
+            panic!("expected Gemini model list")
+        };
+        assert_eq!(
+            result
+                .models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            ["gemini-2.5-pro", "gemini-2.5-flash"]
+        );
+        let request = server.join().unwrap().to_ascii_lowercase();
+        assert!(request.starts_with("get /v1beta/models http/1.1"));
+        assert!(request.contains("x-goog-api-key: fixture-google-key"));
+        assert!(!request.contains("authorization:"));
+        assert!(!request.contains("x-api-key:"));
+        assert!(!request
+            .lines()
+            .next()
+            .unwrap()
+            .contains("fixture-google-key"));
+    }
+
+    #[test]
+    fn static_and_environment_headers_are_applied_to_model_discovery() {
+        let config = "model_provider='custom'\n[model_providers.custom]\nhttp_headers={User-Agent='Fixture agent',HTTP-Referer='https://fixture.example.test'}\nenv_http_headers={X-Project='FIXTURE_PROJECT'}\n";
+        let headers = provider_models_headers_with_env(Some(config), |name| {
+            (name == "FIXTURE_PROJECT").then(|| "fixture-project-value".to_string())
+        })
+        .unwrap();
+        assert!(!format!("{headers:?}").contains("fixture-project-value"));
+        let (url, server) = serve_once(200, r#"{"data":[]}"#);
+        request_provider_models_with_headers(
+            &direct_client(),
+            &url,
+            Some("fixture-api-key"),
+            UpstreamApi::Responses,
+            headers,
+        )
+        .unwrap();
+        let request = server.join().unwrap().to_ascii_lowercase();
+        assert!(request.contains("user-agent: fixture agent"));
+        assert!(request.contains("http-referer: https://fixture.example.test"));
+        assert!(request.contains("x-project: fixture-project-value"));
+        assert!(request.contains("authorization: bearer fixture-api-key"));
+    }
+
+    #[test]
+    fn explicit_auth_and_anthropic_version_headers_override_request_defaults() {
+        let config = "model_provider='custom'\n[model_providers.custom]\nhttp_headers={Authorization='Bearer fixture-custom-auth',anthropic-version='2099-01-01'}\n";
+        let (url, server) = serve_once(200, r#"{"data":[]}"#);
+        request_provider_models_with_protocol_client(
+            &direct_client(),
+            &url,
+            Some("fixture-unused-key"),
+            UpstreamApi::AnthropicMessages,
+            Some(config),
+        )
+        .unwrap();
+        let request = server.join().unwrap().to_ascii_lowercase();
+        assert!(request.contains("authorization: bearer fixture-custom-auth"));
+        assert!(request.contains("anthropic-version: 2099-01-01"));
+        assert!(!request.contains("anthropic-version: 2023-06-01"));
+        assert!(!request.contains("x-api-key:"));
+        assert!(!request.contains("fixture-unused-key"));
+    }
+
+    #[test]
+    fn header_validation_rejects_duplicates_and_invalid_resolved_values_without_secret_echo() {
+        let duplicate = "model_provider='custom'\n[model_providers.custom]\nhttp_headers={X-Project='fixture-static-secret'}\nenv_http_headers={x-project='FIXTURE_PROJECT'}\n";
+        let error = provider_models_headers_with_env(Some(duplicate), |_| {
+            panic!("validation must happen before resolving environment values")
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(!error.contains("fixture-static-secret"));
+        assert!(error.contains("重复"));
+        let env = "model_provider='custom'\n[model_providers.custom]\nenv_http_headers={X-Project='FIXTURE_PROJECT'}\n";
+        for resolved in [
+            None,
+            Some("fixture-env-secret\r\nInjected: value".to_string()),
+        ] {
+            let error = provider_models_headers_with_env(Some(env), |_| resolved.clone())
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("X-Project"));
+            assert!(!error.contains("fixture-env-secret"));
+            assert!(!error.contains("Injected"));
+        }
+    }
+
+    #[test]
+    fn gemini_payload_errors_and_authentication_statuses_do_not_echo_private_data() {
+        let (url, server) = serve_once(200, r#"{"models":"fixture-private-response"}"#);
+        let error = request_provider_models_with_protocol_client(
+            &direct_client(),
+            &url,
+            Some("fixture-google-secret"),
+            UpstreamApi::Gemini,
+            None,
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(!error.contains("fixture-private-response"));
+        assert!(!error.contains("fixture-google-secret"));
+        server.join().unwrap();
+        let (url, server) = serve_once(401, r#"{"error":"fixture-auth-private-response"}"#);
+        let attempt = request_provider_models_with_protocol_client(
+            &direct_client(),
+            &url,
+            Some("fixture-anthropic-secret"),
+            UpstreamApi::AnthropicMessages,
+            None,
+        )
+        .unwrap();
+        let ProviderModelsAttempt::HttpError {
+            status,
+            duration_ms,
+        } = attempt
+        else {
+            panic!("expected authentication status")
+        };
+        let result = provider_status_result(status, duration_ms);
+        assert!(!result.ok);
+        assert_eq!(result.status, Some(401));
+        assert!(!result.message.contains("fixture-auth-private-response"));
+        assert!(!result.message.contains("fixture-anthropic-secret"));
+        server.join().unwrap();
     }
 }
