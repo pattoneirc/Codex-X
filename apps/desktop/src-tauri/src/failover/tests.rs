@@ -603,26 +603,77 @@ fn converted_stopped_update_handoff_resumes_the_same_protocol_and_settings() {
 #[test]
 fn converted_shutdown_keeps_external_selection_and_does_not_reattach_it() {
     let _guard = crate::app_db::test_db_guard();
-    let fixture = converted_fixture("gemini");
-    let mut doc = parsed(&fixture);
-    doc["model_provider"] = value("external");
-    let mut table = Table::new();
-    table["name"] = value("External fixture");
-    table["base_url"] = value("https://external-fixture.example.test/v1");
-    table["wire_api"] = value("responses");
-    table["requires_openai_auth"] = value(false);
-    replace_table(&mut doc, "external", table).unwrap();
-    let external = doc.to_string();
-    fs::write(crate::config_path(&fixture.dir), &external).unwrap();
-    shutdown_all().unwrap();
-    assert_eq!(fixture.text(), external);
-    assert!(!load_record(&fixture.dir).unwrap().settings.takeover_enabled);
-    SHUTTING_DOWN.store(false, Ordering::Release);
-    initialize().unwrap();
-    assert_eq!(fixture.text(), external);
-    let runtime = lock_manager().unwrap().remove(&fixture.dir).unwrap();
-    assert!(runtime.journal.is_none());
-    runtime.proxy.shutdown();
+    for detach_before_shutdown in [false, true] {
+        let fixture = converted_fixture("gemini");
+        let journal = lock_manager()
+            .unwrap()
+            .get(&fixture.dir)
+            .unwrap()
+            .journal
+            .clone()
+            .unwrap();
+        let auth = fs::read(fixture.dir.join("auth.json")).unwrap();
+        if !detach_before_shutdown {
+            // Freeze the watcher before the external edit so this case covers
+            // shutdown seeing the converted journal itself, deterministically.
+            begin_update_handoff().unwrap();
+        }
+        let mut doc = parsed(&fixture);
+        doc["model_provider"] = value("external");
+        let mut table = Table::new();
+        table["name"] = value("External fixture");
+        table["base_url"] = value("https://external-fixture.example.test/v1");
+        table["wire_api"] = value("responses");
+        table["requires_openai_auth"] = value(false);
+        replace_table(&mut doc, "external", table).unwrap();
+        let external = doc.to_string();
+        let detached_doc = restored_document(&doc, &journal).unwrap();
+        // Independently verify that the projection only changes our inactive
+        // provider table, not the external selection/table or any user config.
+        let mut unmanaged_before = doc.clone();
+        let mut unmanaged_after = detached_doc.clone();
+        for document in [&mut unmanaged_before, &mut unmanaged_after] {
+            document
+                .get_mut("model_providers")
+                .and_then(Item::as_table_mut)
+                .unwrap()
+                .remove(&journal.provider_key);
+        }
+        assert_eq!(unmanaged_after.to_string(), unmanaged_before.to_string());
+        let detached = detached_doc.to_string();
+        fs::write(crate::config_path(&fixture.dir), &external).unwrap();
+        let expected = if detach_before_shutdown {
+            // The production watcher is allowed to clean its inactive owned
+            // overlay after an external selection. Complete that same path
+            // synchronously rather than racing its three-second scan.
+            refresh_saved_routes().unwrap();
+            assert_eq!(fixture.text(), detached);
+            assert!(lock_manager()
+                .unwrap()
+                .get(&fixture.dir)
+                .unwrap()
+                .journal
+                .is_none());
+            detached
+        } else {
+            external
+        };
+        shutdown_all().unwrap();
+        assert_eq!(fixture.text(), expected);
+        assert_eq!(
+            parsed(&fixture)["model_provider"].as_str(),
+            Some("external")
+        );
+        assert_eq!(fs::read(fixture.dir.join("auth.json")).unwrap(), auth);
+        assert!(!load_record(&fixture.dir).unwrap().settings.takeover_enabled);
+        SHUTTING_DOWN.store(false, Ordering::Release);
+        initialize().unwrap();
+        assert_eq!(fixture.text(), expected);
+        assert_eq!(fs::read(fixture.dir.join("auth.json")).unwrap(), auth);
+        let runtime = lock_manager().unwrap().remove(&fixture.dir).unwrap();
+        assert!(runtime.journal.is_none());
+        runtime.proxy.shutdown();
+    }
 }
 
 #[test]

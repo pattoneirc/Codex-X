@@ -18,6 +18,8 @@ import { PageTransition } from "../components/PageTransition";
 import { Button, ModalShell } from "../components/ui";
 import { UsageStatisticsPage } from "./UsageStatisticsPage";
 import { ProviderFailoverPage } from "./ProviderFailoverPage";
+import type { CodexLanguageStatus } from "../codexLanguageTypes";
+import { CodexLanguageControl } from "../components/CodexLanguageControl";
 import "../styles/utility-pages.css";
 
 export type UtilityLanguage = "zh" | "en";
@@ -114,6 +116,9 @@ export type SettingsPageProps = {
   onRestartCodex: () => Promise<boolean>;
   recheckBusy?: boolean;
   restartBusy?: boolean;
+  interactionBusy?: boolean;
+  onLanguageBusyChange?: (busy: boolean) => void;
+  onCodexLanguageSaved?: (status: CodexLanguageStatus) => void;
   generalRequest?: number;
   configHealthStatus?: ReactNode;
   onChange?: () => void | Promise<void>;
@@ -167,6 +172,9 @@ export function SettingsPage({
   onRestartCodex,
   recheckBusy = false,
   restartBusy = false,
+  interactionBusy = false,
+  onLanguageBusyChange,
+  onCodexLanguageSaved,
   generalRequest = 0,
   configHealthStatus,
   onChange,
@@ -182,7 +190,7 @@ export function SettingsPage({
     if (!restartBusy) setRestartConfirmOpen(false);
   };
   const confirmRestart = async () => {
-    if (restartBusy) return;
+    if (restartBusy || interactionBusy) return;
     if (await onRestartCodex()) setRestartConfirmOpen(false);
   };
 
@@ -232,6 +240,8 @@ export function SettingsPage({
               )}
             />
 
+            <CodexLanguageControl lang={lang} configDir={configDir} active={active && tab === "general"} disabled={interactionBusy} onBusyChange={onLanguageBusyChange} onPreferencesSaved={onCodexLanguageSaved} />
+
             <SettingRow
               icon={Sparkles}
               title={copy.productTitle}
@@ -268,7 +278,7 @@ export function SettingsPage({
                   type="button"
                   className="cx-page-button cx-page-button--secondary"
                   onClick={() => setRestartConfirmOpen(true)}
-                  disabled={restartBusy}
+                  disabled={restartBusy || interactionBusy}
                 >
                   {restartBusy ? <Loader2 size={15} className="cx-page-spin" aria-hidden="true" /> : <Power size={15} aria-hidden="true" />}
                   {restartBusy ? copy.restartingLabel : copy.restartLabel}
@@ -306,7 +316,7 @@ export function SettingsPage({
               variant="danger"
               icon={restartBusy ? <Loader2 size={16} className="cx-page-spin" /> : <Power size={16} />}
               onClick={() => void confirmRestart()}
-              disabled={restartBusy}
+              disabled={restartBusy || interactionBusy}
             >
               {restartBusy ? copy.restartingLabel : copy.restartConfirmLabel}
             </Button>

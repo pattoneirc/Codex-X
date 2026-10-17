@@ -3,8 +3,8 @@ use super::catalog::{scan_catalog_internal_thread_ids, scan_catalog_sync, Catalo
 use super::directory_identity::session_directory_identities;
 use super::storage::{
     current_model_provider, discover_sqlite_databases, ensure_sqlite_discovery_writable,
-    list_session_previews_with_paths, rollout_internal_thread_ids, scan_provider_rollouts,
-    scan_rollouts_for_thread_ids, scan_sqlite_with_paths, SqliteDiscovery,
+    inspect_provider_rollouts, list_session_previews_with_paths, rollout_internal_thread_ids,
+    scan_provider_rollouts, scan_sqlite_with_paths, validate_rollout_references, SqliteDiscovery,
 };
 use super::transaction::{
     execute_provider_sync_mutation, mutation_error, prepare_sqlite_updates, rollback_mutation,
@@ -28,22 +28,6 @@ fn scan_failure_error(failures: &[String]) -> CodexxError {
     )
 }
 
-fn scan_provider_buckets(
-    codex_dir: &Path,
-    target_provider: &str,
-    sqlite: &SqliteScan,
-) -> Result<RolloutScan> {
-    let mut rollouts = scan_rollouts_for_thread_ids(
-        codex_dir,
-        target_provider,
-        &sqlite.syncable_thread_ids,
-        &sqlite.rollout_paths_by_thread_id,
-    )?;
-    // Provider synchronization must not repair or rewrite the independent cwd index.
-    rollouts.cwd_by_thread_id.clear();
-    Ok(rollouts)
-}
-
 fn scan_legacy_index_warnings(
     codex_dir: &Path,
     target_provider: &str,
@@ -62,8 +46,7 @@ fn scan_legacy_index_warnings(
         return Vec::new();
     }
     let failures = scan_sqlite_with_paths(&legacy_paths, &RolloutScan::default(), target_provider)
-        .and_then(|sqlite| scan_provider_buckets(codex_dir, target_provider, &sqlite))
-        .map(|scan| scan.scan_failures)
+        .map(|sqlite| validate_rollout_references(codex_dir, &sqlite.rollout_paths_by_thread_id))
         .unwrap_or_else(|error| vec![error.to_string()]);
     failures
         .into_iter()
@@ -85,6 +68,7 @@ fn scan_provider_sync_data(
     codex_dir: &Path,
     target_provider: &str,
     discovery: &SqliteDiscovery,
+    stage_changes: bool,
 ) -> Result<ProviderSyncScan> {
     let active_unclassified = scan_sqlite_with_paths(
         &discovery.active_paths,
@@ -128,18 +112,21 @@ fn scan_provider_sync_data(
     sqlite.mismatched_thread_ids = mismatched_thread_ids;
     sqlite.mismatched_threads = sqlite.mismatched_thread_ids.len();
 
-    // Only diagnostics from this authority scan are needed below. Drop its
-    // planned file copies before scanning the complete provider history.
-    let (indexed_rollout_failures, indexed_blocked_failures) = {
-        let rollouts = if active_sqlite.sqlite_dbs > 0 {
-            scan_provider_buckets(codex_dir, target_provider, &active_sqlite)?
+    let indexed_rollout_failures = {
+        let authority = if active_sqlite.sqlite_dbs > 0 {
+            &active_sqlite
         } else {
-            scan_provider_buckets(codex_dir, target_provider, &sqlite)?
+            &sqlite
         };
-        (rollouts.scan_failures, rollouts.blocked_failures)
+        validate_rollout_references(codex_dir, &authority.rollout_paths_by_thread_id)
     };
     let legacy_index_warnings = scan_legacy_index_warnings(codex_dir, target_provider, discovery);
-    let mut rollouts = scan_provider_rollouts(
+    let scan_rollouts = if stage_changes {
+        scan_provider_rollouts
+    } else {
+        inspect_provider_rollouts
+    };
+    let mut rollouts = scan_rollouts(
         codex_dir,
         target_provider,
         &excluded_thread_ids,
@@ -176,7 +163,6 @@ fn scan_provider_sync_data(
     scan_failures.extend(active_sqlite.scan_failures.iter().cloned());
     scan_failures.extend(sqlite.scan_failures.iter().cloned());
     scan_failures.extend(indexed_rollout_failures.iter().cloned());
-    scan_failures.extend(indexed_blocked_failures);
     // A size/buffer limit means the rollout was not completely inspected.
     // This is blocking even for an orphan, rather than a success with a warning.
     scan_failures.extend(rollouts.blocked_failures.iter().cloned());
@@ -224,7 +210,7 @@ pub(super) fn session_sync_status_with_discovery(
     target: String,
     discovery: &SqliteDiscovery,
 ) -> Result<SessionSyncStatus> {
-    let scan = scan_provider_sync_data(codex_dir, &target, discovery)?;
+    let scan = scan_provider_sync_data(codex_dir, &target, discovery, false)?;
     let display_sqlite = if scan.active_sqlite.sqlite_dbs > 0 {
         &scan.active_sqlite
     } else {
@@ -385,14 +371,10 @@ where
     if !initial_status.scan_complete {
         return Err(scan_failure_error(&initial_status.scan_failures));
     }
-    let preflight_scan = scan_provider_sync_data(&codex_dir, &target_provider, &discovery)?;
-    if !preflight_scan.scan_failures.is_empty() {
-        return Err(scan_failure_error(&preflight_scan.scan_failures));
-    }
-    if preflight_scan.rollouts.changes.is_empty()
-        && preflight_scan.sqlite.mismatched_threads == 0
-        && preflight_scan.catalog.total_updates() == 0
-    {
+    // This status already completed the same full scan. Repeating it before
+    // acquiring SQLite locks neither establishes a newer protected snapshot
+    // nor improves the mutation guard; the locked scan below does that.
+    if !initial_status.needs_sync {
         return Ok(SessionSyncResult {
             status: initial_status,
             updated_rollouts: 0,
@@ -400,11 +382,10 @@ where
             backup_dir: String::new(),
         });
     }
-    drop(preflight_scan);
 
     hook(MutationPoint::BeforeSqliteLock)?;
     let mut pending_sqlite = prepare_sqlite_updates(&discovery.related_paths)?;
-    let scan = match scan_provider_sync_data(&codex_dir, &target_provider, &discovery) {
+    let scan = match scan_provider_sync_data(&codex_dir, &target_provider, &discovery, true) {
         Ok(scan) => scan,
         Err(error) => {
             rollback_open_transactions(&mut pending_sqlite);
@@ -520,6 +501,16 @@ mod tests {
 
     const SHARED_SESSION_PROVIDER: &str = "custom";
     const LEGACY_LIMIT: u64 = 32 * 1024 * 1024;
+
+    mod compressed {
+        use super::*;
+        include!("compressed_sync_tests.rs");
+    }
+
+    mod benchmark {
+        use super::*;
+        include!("session_sync_benchmark.rs");
+    }
 
     fn temp_codex_dir(label: &str) -> std::path::PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);

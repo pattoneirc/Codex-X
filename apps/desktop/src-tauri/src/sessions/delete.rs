@@ -1,5 +1,7 @@
 use super::app_server::delete_sessions_via_codex_app_server;
-use super::rollout_stream::{for_each_jsonl_record, record_matches_top_level_strings};
+use super::rollout_stream::{
+    for_each_jsonl_record, record_matches_top_level_strings, resolved_rollout_path,
+};
 use super::storage::{
     current_model_provider, discover_sqlite_databases, ensure_sqlite_discovery_writable,
     is_canonical_rollout_storage_path, rollout_filename_matches_id, scan_rollouts,
@@ -404,9 +406,11 @@ fn canonical_rollout_path(codex_dir: &Path, value: &str, id: &str) -> Result<Opt
     } else {
         codex_dir.join(raw)
     };
-    if !path.exists() {
-        return Ok(None);
-    }
+    let path = match resolved_rollout_path(&path) {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(io_err(&path, error)),
+    };
     if !rollout_filename_matches_id(&path, id) {
         return Err(CodexxError::Config(format!(
             "会话文件名与 ID 不匹配，已拒绝删除: {}",
@@ -1397,6 +1401,26 @@ mod tests {
             [id],
         )
         .expect("insert thread");
+    }
+
+    #[test]
+    fn deletion_target_resolves_compressed_logical_alias_without_selecting_another_history() {
+        let codex_dir = temp_codex_dir();
+        let id = "01a0e854-0000-7000-8000-000000000001";
+        let logical = codex_dir.join(format!("sessions/rollout-current-{id}.jsonl"));
+        fs::create_dir_all(logical.parent().unwrap()).unwrap();
+        let compressed = logical.with_extension("jsonl.zst");
+        fs::write(
+            &compressed,
+            zstd::stream::encode_all(&b"{}\n"[..], 1).unwrap(),
+        )
+        .unwrap();
+        let found = canonical_rollout_path(&codex_dir, &logical.display().to_string(), id).unwrap();
+        assert_eq!(found, Some(compressed.canonicalize().unwrap()));
+        fs::write(&logical, b"{}\n").unwrap();
+        let found = canonical_rollout_path(&codex_dir, &logical.display().to_string(), id).unwrap();
+        assert_eq!(found, Some(logical.canonicalize().unwrap()));
+        fs::remove_dir_all(codex_dir).unwrap();
     }
 
     #[test]

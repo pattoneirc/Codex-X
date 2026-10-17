@@ -23,10 +23,13 @@ import type { LucideIcon } from "lucide-react";
 import type { Ref } from "react";
 import { PageTransition } from "../components/PageTransition";
 import { OfficialQuotaDialog } from "../components/OfficialQuotaDialog";
+import { ProviderBalanceBadge } from "../components/ProviderBalanceBadge";
+import { supportsProviderBalance, type ProviderBalanceState } from "../providerBalance";
 import { OfficialAccountBadge } from "../components/OfficialAccountBadge";
 import { ProviderModelMappings, validateProviderModelMappings } from "../components/ProviderModelMappings";
 import { ProviderHeadersControl } from "../components/ProviderHeadersControl";
 import { providerUpstreamApi } from "../providerProtocol";
+import { OfficialAuthImportError, readOfficialAuthImport } from "../officialAuthImport";
 import { ProviderPresetPicker } from "../components/ProviderPresetPicker";
 import { PROVIDER_PRESETS, getProviderPreset, getProviderPresetVariant } from "../providerPresets";
 import { Button, Checkbox, ModalShell } from "../components/ui";
@@ -153,9 +156,11 @@ export type ProvidersPageProps = {
   copy: ProviderCopy;
   mode: ProviderMode;
   providerRows: readonly ProviderRow[];
+  providerBalances?: ProviderBalanceState;
   loading: boolean;
   testingId: string;
   actionBusy?: string;
+  activationBusy?: boolean;
   orderBusy?: boolean;
   onReorderProviders: (order: string[]) => Promise<boolean>;
   editingProviderId: string | null;
@@ -401,9 +406,11 @@ function ListPage({
   configDir,
   copy,
   providerRows,
+  providerBalances,
   loading,
   testingId,
   actionBusy,
+  activationBusy,
   orderBusy,
   onImportCcSwitch,
   onAddProvider,
@@ -413,11 +420,12 @@ function ListPage({
   onDuplicateProvider,
   onDeleteProvider,
   onReorderProviders,
-}: Pick<ProvidersPageProps, "lang" | "configDir" | "copy" | "providerRows" | "loading" | "testingId" | "actionBusy" | "orderBusy" | "onReorderProviders" | "onImportCcSwitch" | "onAddProvider" | "onEnableProvider" | "onTestProvider" | "onEditProvider" | "onDuplicateProvider" | "onDeleteProvider">) {
+}: Pick<ProvidersPageProps, "lang" | "configDir" | "copy" | "providerRows" | "providerBalances" | "loading" | "testingId" | "actionBusy" | "activationBusy" | "orderBusy" | "onReorderProviders" | "onImportCcSwitch" | "onAddProvider" | "onEnableProvider" | "onTestProvider" | "onEditProvider" | "onDuplicateProvider" | "onDeleteProvider">) {
   const [providerToDelete, setProviderToDelete] = useState<ProviderRow | null>(null);
   const [quotaSelection, setQuotaSelection] = useState<{ id: string; configDir: string; email: string | null } | null>(null);
   const [deleting, setDeleting] = useState(false);
   const providerActionsBusy = loading || Boolean(actionBusy);
+  const providerActivationBusy = activationBusy ?? providerActionsBusy;
   const sortingDisabled = providerActionsBusy || Boolean(orderBusy) || providerRows.length < 2;
   const listRef = useRef<HTMLDivElement>(null);
   const pointerDragRef = useRef<{ key: string; pointerId: number; startY: number; moved: boolean } | null>(null);
@@ -534,13 +542,15 @@ function ListPage({
         {providerRows.length === 0 ? (
           <div className="cx-providers-empty" role="status">{copy.noProviders}</div>
         ) : providerRows.map((row) => {
+          const balance = providerBalances?.balances.find(item => item.source === row.source && item.providerId === row.id);
+          const showBalance = row.source !== "official" && (balance ? balance.supported : supportsProviderBalance(row.baseUrl));
           const testingKey = row.testingKey || `${row.source}-${row.id}`;
           const isTesting = testingId === testingKey;
           const isProtectedOfficial = row.source === "official" && row.isDefaultOfficial === true;
           const key = providerRowKey(row);
           const modelName = row.modelDisplayName || row.model || (lang === "zh" ? "跟随 Codex" : "Follow Codex");
           return (
-            <article className={`cx-providers-row${row.isCurrent ? " cx-providers-row--current" : ""}${row.source === "official" ? " cx-providers-row--official" : ""}${draggedKey === key ? " cx-providers-row--dragging" : ""}${dropTarget?.key === key && draggedKey !== key ? ` cx-providers-row--drop-${dropTarget.position}` : ""}`} key={key} role="listitem" data-provider-key={key}>
+            <article className={`cx-providers-row${row.isCurrent ? " cx-providers-row--current" : ""}${row.source === "official" ? " cx-providers-row--official" : showBalance ? " cx-providers-row--balance" : ""}${draggedKey === key ? " cx-providers-row--dragging" : ""}${dropTarget?.key === key && draggedKey !== key ? ` cx-providers-row--drop-${dropTarget.position}` : ""}`} key={key} role="listitem" data-provider-key={key}>
               <button type="button" className="cx-providers-drag-handle" disabled={sortingDisabled}
                 aria-label={lang === "zh" ? `排序 ${row.providerName}：拖动或按上下箭头移动` : `Reorder ${row.providerName}: drag or use Up and Down arrows`}
                 title={lang === "zh" ? "拖动排序，也可按上下箭头移动" : "Drag to reorder, or use Up and Down arrows"}
@@ -598,13 +608,14 @@ function ListPage({
                 </div>
               </div>
               {row.source === "official" && <OfficialAccountBadge lang={lang} email={row.email} planType={row.planType} hasAuth={Boolean(row.hasAuth)} canQueryQuota={Boolean(row.canQueryQuota)} className="cx-providers-login-badge" />}
+              {showBalance && <ProviderBalanceBadge balance={balance} loading={providerBalances?.loading ?? true} refreshing={providerBalances?.refreshingKeys.includes(`${row.source}:${row.id}`)} failed={providerBalances?.failed ?? false} lang={lang} onRefresh={row.source !== "official" && providerBalances ? () => { void providerBalances.refreshBalance(row.source as "local" | "detected", row.id); } : undefined} />}
               <div className="cx-providers-row-actions">
                 {row.isCurrent && <span className="cx-providers-current-badge"><span aria-hidden="true" />{copy.currentLabel}</span>}
                 <button
                   type="button"
                   className="cx-providers-button cx-providers-button--small cx-providers-button--secondary"
                   onClick={() => onEnableProvider(row)}
-                  disabled={providerActionsBusy || row.isCurrent}
+                  disabled={providerActivationBusy || row.isCurrent}
                 >
                   {copy.enableLabel}
                 </button>
@@ -736,9 +747,15 @@ function OfficialForm({
 }: Pick<ProvidersPageProps, "lang" | "copy" | "creatingProvider" | "selectedPresetId" | "selectedPresetVariantId" | "onPresetSelect" | "onPresetVariantSelect" | "officialForm" | "officialProfileIsDefault" | "canLoadCurrentOfficial" | "officialAuthRef" | "officialTomlRef" | "officialInfo" | "loading" | "actionBusy" | "onCancelMode" | "onOfficialNameChange" | "onOfficialModelChange" | "onOfficialAuthChange" | "onOfficialConfigChange" | "onSaveOfficial" | "onLoadCcSwitchOfficial" | "onLoadCurrentOfficial" | "onResetOfficial">) {
   const [resetConfirmOpen, setResetConfirmOpen] = useState(false);
   const [contextWindowBusy, setContextWindowBusy] = useState(false);
+  const [authImportBusy, setAuthImportBusy] = useState(false);
+  const [authImportError, setAuthImportError] = useState("");
+  const [authImportName, setAuthImportName] = useState("");
+  const authFileRef = useRef<HTMLInputElement>(null);
+  const authImportRequest = useRef(0);
+  useEffect(() => () => { authImportRequest.current += 1; }, []);
   const loadingCcSwitch = actionBusy === "loadCcSwitchOfficial";
   const loadingCurrent = actionBusy === "loadCurrentOfficial";
-  const formBusy = loading || actionBusy === "loadOfficialDraft" || loadingCcSwitch || loadingCurrent || contextWindowBusy;
+  const formBusy = loading || actionBusy === "loadOfficialDraft" || loadingCcSwitch || loadingCurrent || contextWindowBusy || authImportBusy;
   const showDefaultActions = officialProfileIsDefault && !creatingProvider;
   const profileHint = lang === "zh"
     ? "认证内容可留空；保存并启用后，在 Codex 中完成登录。复制官方供应商会保留原认证，并可修改名称。"
@@ -748,6 +765,23 @@ function OfficialForm({
     if (!showDefaultActions || formBusy) return;
     setResetConfirmOpen(false);
     onResetOfficial();
+  };
+
+  const importAuthFile = async (file: File) => {
+    if (formBusy) return;
+    const request = ++authImportRequest.current;
+    setAuthImportBusy(true); setAuthImportError(""); setAuthImportName("");
+    try {
+      const text = await readOfficialAuthImport(file);
+      if (request !== authImportRequest.current) return;
+      onOfficialAuthChange(text);
+      setAuthImportName(file.name);
+    } catch (error) {
+      if (request !== authImportRequest.current) return;
+      setAuthImportError(error instanceof OfficialAuthImportError && error.code === "too_large"
+        ? (lang === "zh" ? "认证文件超过 1 MiB，请选择单个 auth.json。" : "Choose a single auth.json file smaller than 1 MiB.")
+        : (lang === "zh" ? "请选择有效的单个 Codex auth.json；批量账号或其他工具的封装格式暂不支持。" : "Choose a valid single Codex auth.json. Account arrays and other export formats are not supported yet."));
+    } finally { if (request === authImportRequest.current) setAuthImportBusy(false); }
   };
 
   return (
@@ -786,6 +820,17 @@ function OfficialForm({
         />
       </div>
       <Field label={copy.officialAuthLabel} className="cx-providers-editor-field">
+        <div className="cx-providers-context-heading">
+          <button type="button" className="cx-providers-button cx-providers-button--secondary" disabled={formBusy} onClick={() => authFileRef.current?.click()}>
+            <Download size={14} aria-hidden="true" />{lang === "zh" ? "导入 auth.json 文件" : "Import auth.json file"}
+          </button>
+          <input ref={authFileRef} type="file" accept=".json,application/json" hidden onChange={event => {
+            const file = event.currentTarget.files?.[0]; event.currentTarget.value = "";
+            if (file) void importAuthFile(file);
+          }} />
+        </div>
+        {authImportError && <span className="cx-providers-context-error" role="alert">{authImportError}</span>}
+        {authImportName && <span className="cx-providers-context-hint" role="status">{lang === "zh" ? `已读入 ${authImportName}，保存官方账号后生效。` : `Loaded ${authImportName}. Save the official account to apply it.`}</span>}
         <textarea
           ref={officialAuthRef}
           className="cx-providers-code-editor cx-providers-auth-editor"

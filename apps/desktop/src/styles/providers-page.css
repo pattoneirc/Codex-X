@@ -222,9 +222,9 @@
   box-shadow: 0 0 0 1px rgba(147, 197, 253, 0.5), 0 3px 10px rgba(37, 99, 235, 0.08);
 }
 
-/* Give official account emails their own centered column. Current-state
-   badges can change the actions without moving the email in any row. */
-.cx-providers-row--official {
+/* Keep account details and provider balances in the same centered column. */
+.cx-providers-row--official,
+.cx-providers-row--balance {
   grid-template-columns: 18px 42px minmax(0, 1fr) minmax(200px, 300px) minmax(310px, 1fr);
 }
 
@@ -242,7 +242,8 @@
 .cx-providers-row-model>b { font-weight: 550; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--cx-provider-text); }
 .cx-providers-row-model>code { margin: 0; flex: 0 1 auto; }
 
-.cx-providers-row--official > .cx-providers-login-badge {
+.cx-providers-row--official > .cx-providers-login-badge,
+.cx-providers-row--balance > .cx-providers-login-badge {
   width: 100%;
   max-width: 100%;
   justify-self: center;
@@ -928,11 +929,13 @@
 
 @media (max-width: 760px) {
   .cx-providers-row,
-  .cx-providers-row--official {
+  .cx-providers-row--official,
+  .cx-providers-row--balance {
     grid-template-columns: 18px 40px minmax(0, 1fr);
   }
 
-  .cx-providers-row--official > .cx-providers-login-badge {
+  .cx-providers-row--official > .cx-providers-login-badge,
+  .cx-providers-row--balance > .cx-providers-login-badge {
     grid-column: 3;
     width: min(300px, 100%);
     justify-self: start;

@@ -175,6 +175,7 @@ fn directory_lookup(path: &str) -> DirectoryIdentity {
         .unwrap_or_else(|_| unresolved_directory_identity(path))
 }
 
+#[cfg(test)]
 fn directory_identity(path: &str) -> String {
     directory_lookup(path).key
 }
@@ -187,9 +188,11 @@ fn pin_scope_key(path: &str, identity: &DirectoryIdentity) -> String {
     }
 }
 
-/// Resolve the paths represented by this status only. The raw spelling remains
-/// the map key. Persistent home scope uses native identity only when birth time
-/// was verified; otherwise it conservatively follows the original home path.
+/// The explicitly selected Codex home may use its native identity. Historical
+/// workspace paths remain lexical: opening or probing them merely to group
+/// sessions can request access to protected macOS folders such as Documents.
+/// Preserve their complete spelling on every platform; without inspecting a
+/// directory, volume defaults cannot exclude per-directory case sensitivity.
 pub(super) fn session_directory_identities(
     codex_dir: &Path,
     sessions: &[SessionPreview],
@@ -202,7 +205,7 @@ pub(super) fn session_directory_identities(
     for path in sessions.iter().filter_map(|session| session.cwd.as_deref()) {
         identities
             .entry(path.to_string())
-            .or_insert_with(|| directory_identity(path));
+            .or_insert_with(|| unresolved_directory_identity(path).key);
     }
     (identities, pin_scope)
 }

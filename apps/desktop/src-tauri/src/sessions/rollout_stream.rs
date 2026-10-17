@@ -19,6 +19,66 @@ const MAX_KEY_CAPTURE_BYTES: usize = 128;
 const MAX_METADATA_STRING_BYTES: usize = 4096;
 const MAX_CWD_BYTES: usize = 32 * 1024;
 
+pub(super) fn is_compressed_rollout(path: &Path) -> bool {
+    path.to_string_lossy().ends_with(".jsonl.zst")
+}
+
+pub(super) fn logical_rollout_path(path: &Path) -> PathBuf {
+    if is_compressed_rollout(path) {
+        path.with_extension("")
+    } else {
+        path.to_path_buf()
+    }
+}
+
+/// Codex keeps the logical .jsonl reference after compressing the same file.
+/// An existing plain representation always wins; other IO failures must not
+/// silently select a possibly stale compressed sibling.
+pub(super) fn resolved_rollout_path(path: &Path) -> std::io::Result<PathBuf> {
+    let logical = logical_rollout_path(path);
+    match fs::symlink_metadata(&logical) {
+        Ok(_) => Ok(logical),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut compressed = logical.into_os_string();
+            compressed.push(".zst");
+            let compressed = PathBuf::from(compressed);
+            fs::symlink_metadata(&compressed)?;
+            Ok(compressed)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub(super) fn decoded_rollout_reader<'a, R: Read + 'a>(
+    reader: R,
+    path: &Path,
+) -> std::io::Result<Box<dyn Read + 'a>> {
+    if is_compressed_rollout(path) {
+        Ok(Box::new(zstd::stream::read::Decoder::new(reader)?))
+    } else {
+        Ok(Box::new(reader))
+    }
+}
+
+/// Never overwrite a compressed history after Codex has expanded its current
+/// logical file. This is checked again at transaction and atomic-write edges.
+pub(super) fn ensure_current_rollout_representation(path: &Path) -> Result<()> {
+    if is_compressed_rollout(path) {
+        let logical = logical_rollout_path(path);
+        match fs::symlink_metadata(&logical) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_err(&logical, error)),
+            Ok(_) => {
+                return Err(format_error(
+                    path,
+                    "会话压缩状态已变化，已停止同步；请重新检查会话",
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 pub(super) struct FirstMeta {
     pub(super) id: String,
@@ -729,9 +789,9 @@ pub(super) fn record_matches_top_level_strings(
     JsonReader::new(record, path).matching_fields(field_names, expected, max_decoded_bytes)
 }
 
-fn copy_hashed<R: Read>(
+fn copy_hashed<R: Read, W: Write>(
     mut reader: R,
-    output: &mut File,
+    output: &mut W,
     hash: &mut Sha256,
     path: &Path,
 ) -> Result<u64> {
@@ -752,11 +812,11 @@ fn copy_hashed<R: Read>(
     }
 }
 
-fn patched_record(
+fn patched_record<W: Write>(
     record: &mut File,
     metadata: &Metadata,
     provider: &[u8],
-    next: &mut File,
+    next: &mut W,
     hash: &mut Sha256,
     path: &Path,
 ) -> Result<()> {
@@ -858,23 +918,14 @@ pub(super) fn read_first_meta<R: Read>(reader: R, path: &Path) -> Result<FirstMe
     }
 }
 
-/// Validate the whole rollout and stage byte-preserving Provider patches. The
-/// only retained buffers are fixed IO buffers and bounded identity fields.
-pub(super) fn scan_rollout_stream(
-    file: &mut File,
+fn scan_records<R: Read, W: Write>(
+    reader: R,
     path: &Path,
+    directory: &Path,
     target_provider: &str,
-) -> Result<StreamedRollout> {
-    if target_provider.len() > MAX_METADATA_STRING_BYTES {
-        return Err(format_error(path, "目标 Provider 标识过长"));
-    }
-    file.seek(SeekFrom::Start(0))
-        .map_err(|error| io_err(path, error))?;
-    let directory = private_directory("codex-x-rollout-snapshot-", path)?;
-    let original_path = directory.path().join("original.jsonl");
-    let next_path = directory.path().join("next.jsonl");
-    let mut original = private_file(&original_path)?;
-    let mut next = private_file(&next_path)?;
+    mut original: Option<&mut File>,
+    next: &mut W,
+) -> Result<(FirstMeta, usize, usize, [u8; 32], [u8; 32])> {
     let provider_json = serde_json::to_vec(target_provider)
         .map_err(|_| format_error(path, "目标 Provider 无法编码"))?;
     let mut original_hash = Sha256::new();
@@ -882,11 +933,13 @@ pub(super) fn scan_rollout_stream(
     let mut first_meta = None;
     let mut session_meta_count = 0;
     let mut mismatch_count = 0;
-    frame_records(&mut *file, directory.path(), path, |record, _length| {
+    frame_records(reader, directory, path, |record, _length| {
         record
             .seek(SeekFrom::Start(0))
             .map_err(|error| io_err(path, error))?;
-        copy_hashed(&mut *record, &mut original, &mut original_hash, path)?;
+        if let Some(original) = original.as_deref_mut() {
+            copy_hashed(&mut *record, original, &mut original_hash, path)?;
+        }
         record
             .seek(SeekFrom::Start(0))
             .map_err(|error| io_err(path, error))?;
@@ -909,7 +962,7 @@ pub(super) fn scan_rollout_stream(
                     record,
                     &metadata,
                     &provider_json,
-                    &mut next,
+                    next,
                     &mut next_hash,
                     path,
                 )?;
@@ -919,17 +972,147 @@ pub(super) fn scan_rollout_stream(
         record
             .seek(SeekFrom::Start(0))
             .map_err(|error| io_err(path, error))?;
-        copy_hashed(record, &mut next, &mut next_hash, path)?;
+        copy_hashed(record, next, &mut next_hash, path)?;
         Ok(())
     })?;
     let first_meta = first_meta.ok_or_else(|| format_error(path, "缺少起始 session_meta"))?;
+    Ok((
+        first_meta,
+        session_meta_count,
+        mismatch_count,
+        original_hash.finalize().into(),
+        next_hash.finalize().into(),
+    ))
+}
+
+/// Validate decoded JSONL with bounded memory. Compressed histories retain
+/// their exact original compressed bytes and receive a streamed compressed
+/// replacement, so ordinary hashes, atomic writes and rollback stay exact.
+pub(super) fn scan_rollout_stream(
+    file: &mut File,
+    path: &Path,
+    target_provider: &str,
+) -> Result<StreamedRollout> {
+    scan_rollout_stream_inner(file, path, target_provider, true)
+}
+
+pub(super) fn inspect_rollout_stream(
+    file: &mut File,
+    path: &Path,
+    target_provider: &str,
+) -> Result<StreamedRollout> {
+    scan_rollout_stream_inner(file, path, target_provider, false)
+}
+
+struct HashingReader<'a> {
+    source: &'a mut File,
+    hash: &'a mut Sha256,
+}
+
+impl Read for HashingReader<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        let count = self.source.read(bytes)?;
+        self.hash.update(&bytes[..count]);
+        Ok(count)
+    }
+}
+
+fn scan_rollout_stream_inner(
+    file: &mut File,
+    path: &Path,
+    target_provider: &str,
+    stage_changes: bool,
+) -> Result<StreamedRollout> {
+    if target_provider.len() > MAX_METADATA_STRING_BYTES {
+        return Err(format_error(path, "目标 Provider 标识过长"));
+    }
+    ensure_current_rollout_representation(path)?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| io_err(path, error))?;
+    let directory = private_directory("codex-x-rollout-snapshot-", path)?;
+    if !stage_changes {
+        let mut raw_hash = Sha256::new();
+        let reader = HashingReader {
+            source: &mut *file,
+            hash: &mut raw_hash,
+        };
+        let reader = decoded_rollout_reader(reader, path).map_err(|error| io_err(path, error))?;
+        let (first_meta, session_meta_count, mismatch_count, _, _) = scan_records(
+            reader,
+            path,
+            directory.path(),
+            target_provider,
+            None,
+            &mut std::io::sink(),
+        )?;
+        return Ok(StreamedRollout {
+            first_meta,
+            session_meta_count,
+            mismatch_count,
+            original_hash: raw_hash.finalize().into(),
+            original_mtime: file
+                .metadata()
+                .map_err(|error| io_err(path, error))?
+                .modified()
+                .ok(),
+            staged: None,
+        });
+    }
+    let extension = if is_compressed_rollout(path) {
+        "jsonl.zst"
+    } else {
+        "jsonl"
+    };
+    let original_path = directory.path().join(format!("original.{extension}"));
+    let next_path = directory.path().join(format!("next.{extension}"));
+    let mut original = private_file(&original_path)?;
+    let mut next = private_file(&next_path)?;
+    let (first_meta, session_meta_count, mismatch_count, original_hash, next_hash) =
+        if is_compressed_rollout(path) {
+            let mut original_hash = Sha256::new();
+            copy_hashed(&mut *file, &mut original, &mut original_hash, path)?;
+            original
+                .seek(SeekFrom::Start(0))
+                .map_err(|error| io_err(path, error))?;
+            let decoder =
+                decoded_rollout_reader(&mut original, path).map_err(|error| io_err(path, error))?;
+            let mut encoder = zstd::stream::write::Encoder::new(&mut next, 3)
+                .map_err(|error| io_err(path, error))?;
+            let (first, count, mismatches, _, _) = scan_records(
+                decoder,
+                path,
+                directory.path(),
+                target_provider,
+                None,
+                &mut encoder,
+            )?;
+            encoder.finish().map_err(|error| io_err(path, error))?;
+            next.seek(SeekFrom::Start(0))
+                .map_err(|error| io_err(path, error))?;
+            let mut next_hash = Sha256::new();
+            copy_hashed(&mut next, &mut std::io::sink(), &mut next_hash, path)?;
+            (
+                first,
+                count,
+                mismatches,
+                original_hash.finalize().into(),
+                next_hash.finalize().into(),
+            )
+        } else {
+            scan_records(
+                &mut *file,
+                path,
+                directory.path(),
+                target_provider,
+                Some(&mut original),
+                &mut next,
+            )?
+        };
     let original_mtime = file
         .metadata()
         .map_err(|error| io_err(path, error))?
         .modified()
         .ok();
-    let original_hash: [u8; 32] = original_hash.finalize().into();
-    let next_hash: [u8; 32] = next_hash.finalize().into();
     let staged = if mismatch_count != 0 {
         original
             .sync_all()
@@ -1003,6 +1186,111 @@ mod tests {
             file.write_all(&buffer[..length]).unwrap();
             remaining -= length;
         }
+    }
+
+    #[test]
+    fn compressed_inspection_keeps_full_validation_and_raw_hash_without_snapshot_or_recompression()
+    {
+        let original = b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"thread\",\"model_provider\":\"openai\"}}\r\n{\"type\":\"event_msg\",\"payload\":{\"message\":\"kept\"}}";
+        let fixture = Fixture::bytes(original);
+        let compressed = fixture.path.with_extension("jsonl.zst");
+        fs::write(
+            &compressed,
+            zstd::stream::encode_all(&original[..], 1).unwrap(),
+        )
+        .unwrap();
+        fs::remove_file(&fixture.path).unwrap();
+        for target in ["openai", "custom"] {
+            let checked =
+                inspect_rollout_stream(&mut File::open(&compressed).unwrap(), &compressed, target)
+                    .unwrap();
+            let staged =
+                scan_rollout_stream(&mut File::open(&compressed).unwrap(), &compressed, target)
+                    .unwrap();
+            assert!(checked.staged.is_none());
+            assert_eq!(checked.original_hash, file_hash(&compressed));
+            assert_eq!(checked.original_hash, staged.original_hash);
+            assert_eq!(checked.session_meta_count, staged.session_meta_count);
+            assert_eq!(checked.mismatch_count, staged.mismatch_count);
+            assert_eq!(checked.first_meta.id, staged.first_meta.id);
+        }
+        // A valid metadata prefix must not make a damaged later frame healthy.
+        let mut raw = zstd::stream::encode_all(&original[..], 1).unwrap();
+        let mut tail = zstd::stream::encode_all(
+            &b"\n{\"type\":\"event_msg\",\"payload\":{\"x\":1}}\n"[..],
+            1,
+        )
+        .unwrap();
+        tail.truncate(tail.len() - 2);
+        raw.extend(tail);
+        fs::write(&compressed, raw).unwrap();
+        assert!(inspect_rollout_stream(
+            &mut File::open(&compressed).unwrap(),
+            &compressed,
+            "openai"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn compressed_records_above_legacy_limit_are_streamed_and_byte_preserved() {
+        let fixture = Fixture::bytes(b"");
+        let compressed = fixture.path.with_extension("jsonl.zst");
+        fs::remove_file(&fixture.path).unwrap();
+        let mut encoder =
+            zstd::stream::write::Encoder::new(File::create(&compressed).unwrap(), 1).unwrap();
+        encoder.write_all(b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"thread\",\"model_provider\":\"openai\"}}\n{\"type\":\"event_msg\",\"payload\":{\"huge\":\"").unwrap();
+        let buffer = [b'x'; IO_BUFFER_BYTES];
+        for _ in 0..(33 * 1024 * 1024 / IO_BUFFER_BYTES) {
+            encoder.write_all(&buffer).unwrap();
+        }
+        encoder.write_all(b"\"}}\r\n").unwrap();
+        encoder.finish().unwrap();
+        let result =
+            scan_rollout_stream(&mut File::open(&compressed).unwrap(), &compressed, "custom")
+                .unwrap();
+        let snapshot = result.staged.unwrap();
+        assert_eq!(file_hash(&compressed), snapshot.original_hash);
+        assert_eq!(file_hash(&snapshot.original_path), snapshot.original_hash);
+        let mut decoded = decoded_rollout_reader(
+            File::open(&snapshot.next_path).unwrap(),
+            &snapshot.next_path,
+        )
+        .unwrap();
+        let meta = read_first_meta(&mut decoded, &snapshot.next_path).unwrap();
+        assert_eq!(meta.provider.as_deref(), Some("custom"));
+        let mut original = BufReader::new(
+            decoded_rollout_reader(File::open(&compressed).unwrap(), &compressed).unwrap(),
+        );
+        let mut original_hash = Sha256::new();
+        let mut next_hash = Sha256::new();
+        let mut first_record = Vec::new();
+        original.read_until(b'\n', &mut first_record).unwrap();
+        copy_hashed(
+            &mut original,
+            &mut std::io::sink(),
+            &mut original_hash,
+            &compressed,
+        )
+        .unwrap();
+        let mut next = BufReader::new(
+            decoded_rollout_reader(
+                File::open(&snapshot.next_path).unwrap(),
+                &snapshot.next_path,
+            )
+            .unwrap(),
+        );
+        first_record.clear();
+        next.read_until(b'\n', &mut first_record).unwrap();
+        let count =
+            copy_hashed(&mut next, &mut std::io::sink(), &mut next_hash, &compressed).unwrap();
+        assert!(count > 32 * 1024 * 1024);
+        assert_eq!(
+            original_hash.finalize(),
+            next_hash.finalize(),
+            "all nonmetadata bytes stay exact after decompression"
+        );
+        assert_eq!(snapshot.next_hash, file_hash(&snapshot.next_path));
     }
 
     #[test]

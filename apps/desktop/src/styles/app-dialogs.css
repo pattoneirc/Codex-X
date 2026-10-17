@@ -420,3 +420,14 @@
 @keyframes cx-app-dialog-spin {
   to { transform: rotate(360deg); }
 }
+
+/* Actionable notices allow time to read and click, using the existing toast. */
+.cx-app-toast--actionable { pointer-events: auto; animation: cx-app-toast-enter 180ms ease-out both, cx-app-toast-exit 180ms ease-in 15s forwards; }
+.cx-app-toast--actionable:hover, .cx-app-toast--actionable:focus-within { animation-play-state: paused; }
+.cx-app-toast-action, .cx-app-toast-dismiss { flex-shrink: 0; border: 0; padding: 4px; background: transparent; color: inherit; cursor: pointer; }
+.cx-app-toast-action { font: inherit; font-size: 12px; font-weight: 600; text-decoration: underline; text-underline-offset: 3px; }
+.cx-app-toast-dismiss { display: grid; place-items: center; opacity: .65; }
+.cx-app-toast-action:disabled { cursor: wait; opacity: .5; }
+.cx-app-toast-action:focus-visible, .cx-app-toast-dismiss:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; border-radius: 3px; }
+
+.cx-app-toast--persistent { pointer-events: auto; animation: cx-app-toast-enter 180ms ease-out both; }

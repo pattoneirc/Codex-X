@@ -8,6 +8,7 @@ import {
   RotateCcw,
   Settings,
   Sparkles,
+  X,
 } from "lucide-react";
 
 import { INITIAL_APP_UPDATER_STATE, isAppUpdateBusy, type AppUpdaterState } from "../appUpdater";
@@ -20,6 +21,8 @@ export type AppToastProps = {
   message: string;
   error: string;
   loading?: boolean;
+  persistent?: boolean;
+  action?: { label: string; onClick: () => void; disabled?: boolean };
   onDismissMessage: () => void;
   onDismissError: () => void;
 };
@@ -29,6 +32,8 @@ export function AppToast({
   message,
   error,
   loading = false,
+  action,
+  persistent = false,
   onDismissMessage,
   onDismissError,
 }: AppToastProps) {
@@ -40,11 +45,12 @@ export function AppToast({
   const [firstLine, ...remainingLines] = activeText.split("\n");
   const detail = remainingLines.join("\n").trim();
   const dismiss = isError ? onDismissError : onDismissMessage;
+  const visibleAction = !loading ? action : undefined;
 
   return (
     <div
       key={`${status}:${activeText}`}
-      className={`cx-app-toast cx-app-toast--${status}`}
+      className={`cx-app-toast cx-app-toast--${status}${visibleAction ? " cx-app-toast--actionable" : ""}${persistent ? " cx-app-toast--persistent" : ""}`}
       role={isError ? "alert" : "status"}
       aria-live={isError ? "assertive" : "polite"}
       onAnimationEnd={(event) => {
@@ -59,6 +65,10 @@ export function AppToast({
         <strong>{firstLine || (isError ? (lang === "zh" ? "操作失败" : "Action failed") : "Codex-X")}</strong>
         {detail && <span>{detail}</span>}
       </div>
+      {visibleAction && <>
+        <button type="button" className="cx-app-toast-action" onClick={visibleAction.onClick} disabled={visibleAction.disabled}>{visibleAction.label}</button>
+        <button type="button" className="cx-app-toast-dismiss" onClick={dismiss} aria-label={lang === "zh" ? "关闭提示" : "Dismiss notification"}><X size={14} aria-hidden="true" /></button>
+      </>}
     </div>
   );
 }

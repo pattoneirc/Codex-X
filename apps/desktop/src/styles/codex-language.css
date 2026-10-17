@@ -1,0 +1,30 @@
+/* Reuse the settings page row, icon, typography and theme tokens. */
+.cx-page-setting-row.cx-codex-language {
+  grid-template-columns: 40px minmax(0, 1fr) auto;
+}
+.cx-codex-language .cx-page-setting-copy p {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cx-page-setting-action.cx-codex-language-action {
+  grid-column: auto;
+  justify-self: end;
+  display: grid;
+  justify-items: end;
+  gap: 5px;
+}
+.cx-codex-language-switch {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--cx-page-muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.cx-codex-language-switch .ui-toggle {
+  --ui-accent: var(--cx-page-blue);
+}
+.cx-codex-language-enabled { color: var(--cx-page-blue); }
+.cx-codex-language-loading { width: 40px; height: 23px; display: grid; place-items: center; }
+.cx-codex-language .cx-page-setting-copy .cx-codex-language-error { color: var(--ui-danger); }

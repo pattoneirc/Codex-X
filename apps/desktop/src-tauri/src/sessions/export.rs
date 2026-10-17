@@ -1,3 +1,4 @@
+use super::rollout_stream::{decoded_rollout_reader, resolved_rollout_path};
 use super::storage::{
     is_canonical_rollout_storage_path, list_session_previews_with_paths, session_project_title,
     sqlite_candidate_paths,
@@ -187,6 +188,7 @@ struct JsonLine<'a, R: BufRead> {
     buffered: usize,
     buffer_ends_line: bool,
     has_content: bool,
+    too_large: bool,
 }
 impl<R: BufRead> Read for JsonLine<'_, R> {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
@@ -199,6 +201,7 @@ impl<R: BufRead> Read for JsonLine<'_, R> {
             return Ok(0);
         }
         if self.consumed >= MAX_RECORD_BYTES {
+            self.too_large = true;
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "record too large",
@@ -240,13 +243,16 @@ fn drain_line<R: BufRead>(reader: &mut R) -> std::io::Result<()> {
 
 fn visit_records(
     file: &mut File,
+    path: &Path,
     length: u64,
     expected_id: &str,
     mut visitor: impl FnMut(Message) -> Result<()>,
 ) -> Result<usize> {
     file.seek(SeekFrom::Start(0))
         .map_err(|error| CodexxError::Config(format!("无法读取会话：{error}")))?;
-    let mut reader = BufReader::new(file.take(length));
+    let decoded =
+        decoded_rollout_reader(file.take(length), path).map_err(|error| io_err(path, error))?;
+    let mut reader = BufReader::new(decoded);
     let mut malformed = 0;
     let mut verified_meta = false;
     loop {
@@ -264,8 +270,14 @@ fn visit_records(
             buffered: 0,
             buffer_ends_line: false,
             has_content: false,
+            too_large: false,
         };
         let parsed = serde_json::from_reader::<_, Record>(&mut line);
+        if let Err(error) = &parsed {
+            if error.is_io() && !line.too_large {
+                return Err(CodexxError::Config(format!("无法读取会话：{error}")));
+            }
+        }
         let ended = line.ended;
         let has_content = line.has_content;
         if !ended {
@@ -315,10 +327,12 @@ fn safe_rollout_path(codex_dir: &Path, session: &SessionPreview) -> Result<PathB
     } else {
         codex_dir.join(path)
     };
+    let path = resolved_rollout_path(&path).map_err(|error| io_err(&path, error))?;
     let metadata = fs::symlink_metadata(&path).map_err(|error| io_err(&path, error))?;
     if !metadata.is_file()
         || metadata.file_type().is_symlink()
-        || !path.to_string_lossy().ends_with(".jsonl")
+        || !(path.to_string_lossy().ends_with(".jsonl")
+            || path.to_string_lossy().ends_with(".jsonl.zst"))
     {
         return Err(CodexxError::Config("不支持此会话文件类型".to_string()));
     }
@@ -351,7 +365,7 @@ fn write_markdown(codex_dir: &Path, session: &SessionPreview, output: &mut File)
     let mut file = File::open(&path).map_err(|error| io_err(&path, error))?;
     let length = file.metadata().map_err(|error| io_err(&path, error))?.len();
     let mut event_counts = HashMap::<[u8; 32], usize>::new();
-    let malformed = visit_records(&mut file, length, &session.id, |message| {
+    let malformed = visit_records(&mut file, &path, length, &session.id, |message| {
         if message.event {
             if event_counts.len() >= MAX_MESSAGE_KEYS {
                 return Err(CodexxError::Config(
@@ -388,7 +402,7 @@ fn write_markdown(codex_dir: &Path, session: &SessionPreview, output: &mut File)
         markdown_label(&session.id)
     ))?;
     let mut count = 0;
-    visit_records(&mut file, length, &session.id, |message| {
+    visit_records(&mut file, &path, length, &session.id, |message| {
         if !message.event {
             if let Some(remaining) = event_counts.get_mut(&message_key(&message)) {
                 if *remaining > 0 {
@@ -710,6 +724,119 @@ mod tests {
     }
     fn response(role: &str, body: &str) -> Value {
         json!({"type":"response_item","timestamp":"2026-09-12T10:00:00Z","payload":{"type":"message","role":role,"content":[{"type":if role == "user" { "input_text" } else { "output_text" },"text":body}]}})
+    }
+
+    fn compress_fixture(path: &Path) -> PathBuf {
+        let compressed = path.with_extension("jsonl.zst");
+        let mut input = File::open(path).unwrap();
+        let mut encoder =
+            zstd::stream::write::Encoder::new(File::create(&compressed).unwrap(), 1).unwrap();
+        encoder.include_checksum(true).unwrap();
+        std::io::copy(&mut input, &mut encoder).unwrap();
+        encoder.finish().unwrap();
+        drop(input);
+        fs::remove_file(path).unwrap();
+        compressed
+    }
+
+    #[test]
+    fn exports_compressed_logical_reference_with_same_deduplication_and_no_storage_changes() {
+        let fixture = Fixture::new();
+        let path = fixture.add(
+            "compressed",
+            "已改名的会话",
+            &[
+                event("user", "中文问题"),
+                response("user", "中文问题"),
+                response("assistant", "完整回答"),
+            ],
+            false,
+        );
+        let expected = fixture.export(&["compressed"], "plain.md").unwrap();
+        let compressed = compress_fixture(&path);
+        let raw_before = fs::read(&compressed).unwrap();
+        let db_before = fs::read(&fixture.database).unwrap();
+        let result = fixture.export(&["compressed"], "compressed.md").unwrap();
+        assert_eq!(
+            fs::read(result.path).unwrap(),
+            fs::read(expected.path).unwrap()
+        );
+        assert_eq!(result.failed_sessions, 0);
+        assert!(result.warnings.is_empty());
+        assert!(!path.exists());
+        assert_eq!(fs::read(compressed).unwrap(), raw_before);
+        assert_eq!(fs::read(&fixture.database).unwrap(), db_before);
+    }
+
+    #[test]
+    fn export_prefers_current_plain_file_over_stale_compressed_sibling() {
+        let fixture = Fixture::new();
+        let path = fixture.add("current", "当前会话", &[event("user", "stale body")], false);
+        let compressed = compress_fixture(&path);
+        fs::write(
+            &path,
+            format!(
+                "{}\n{}\n",
+                json!({"type":"session_meta","payload":{"id":"current"}}),
+                event("user", "current body")
+            ),
+        )
+        .unwrap();
+        let before = fs::read(&compressed).unwrap();
+        let result = fixture.export(&["current"], "current.md").unwrap();
+        let text = fs::read_to_string(result.path).unwrap();
+        assert!(text.contains("current body"));
+        assert!(!text.contains("stale body"));
+        assert_eq!(fs::read(compressed).unwrap(), before);
+    }
+
+    #[test]
+    fn corrupt_compression_is_an_error_and_preserves_existing_export() {
+        let fixture = Fixture::new();
+        let path = fixture.add(
+            "corrupt",
+            "损坏的压缩会话",
+            &[event("user", "must not publish a partial export")],
+            false,
+        );
+        let compressed = compress_fixture(&path);
+        let mut bytes = fs::read(&compressed).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x80;
+        fs::write(&compressed, &bytes).unwrap();
+        let destination = fixture.root.join("protected.md");
+        fs::write(&destination, "existing export").unwrap();
+        assert!(fixture.export(&["corrupt"], "protected.md").is_err());
+        assert_eq!(fs::read_to_string(destination).unwrap(), "existing export");
+        assert_eq!(fs::read(compressed).unwrap(), bytes);
+        assert!(fs::read_dir(&fixture.root).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".codex-x-export-")));
+    }
+
+    #[test]
+    fn compressed_identity_mismatch_does_not_export_another_conversation() {
+        let fixture = Fixture::new();
+        let path = fixture.add(
+            "selected",
+            "所选会话",
+            &[event("user", "private fixture")],
+            false,
+        );
+        fs::write(
+            &path,
+            format!(
+                "{}\n{}\n",
+                json!({"type":"session_meta","payload":{"id":"different"}}),
+                event("user", "private fixture")
+            ),
+        )
+        .unwrap();
+        compress_fixture(&path);
+        assert!(fixture.export(&["selected"], "mismatch.md").is_err());
+        assert!(!fixture.root.join("mismatch.md").exists());
     }
 
     #[test]

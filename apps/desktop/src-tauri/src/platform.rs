@@ -7,6 +7,9 @@ use std::sync::{mpsc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[path = "codex_desktop_windows.rs"]
+pub(crate) mod desktop_windows;
+
 #[cfg(target_os = "windows")]
 use std::env;
 
@@ -36,7 +39,7 @@ const CODEX_DESKTOP_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const CODEX_DESKTOP_QUIT_TIMEOUT: Duration = Duration::from_secs(8);
 #[cfg(target_os = "macos")]
 const CODEX_DESKTOP_POLL_INTERVAL: Duration = Duration::from_millis(100);
-#[cfg(any(target_os = "windows", test))]
+#[cfg(test)]
 const WINDOWS_RESTART_RESULT_PREFIX: &str = "CODEX_X_DESKTOP_RESTART";
 
 #[cfg(any(target_os = "macos", test))]
@@ -816,96 +819,209 @@ fn macos_main_process_ids(
     ))
 }
 
+pub(crate) fn desktop_command_output(
+    program: &Path,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<Output, String> {
+    run_program_with_timeout(program, args, Some(Instant::now() + timeout), timeout)
+        .ok_or_else(|| "客户端系统操作超时，未继续重启或连接客户端。".into())
+}
+
+#[cfg(target_os = "macos")]
+fn wait_macos_stopped(executable: &Path) -> Result<(), String> {
+    let deadline = Instant::now() + CODEX_DESKTOP_QUIT_TIMEOUT;
+    let mut empty_since = None;
+    while Instant::now() < deadline {
+        let pids = match macos_main_process_ids(executable, Some(deadline)) {
+            Ok(pids) => pids,
+            Err(_) if Instant::now() >= deadline => break,
+            Err(error) => return Err(error),
+        };
+        if pids.is_empty() {
+            let since = empty_since.get_or_insert_with(Instant::now);
+            if since.elapsed() >= Duration::from_millis(500) {
+                return Ok(());
+            }
+        } else {
+            empty_since = None;
+        }
+        thread::sleep(CODEX_DESKTOP_POLL_INTERVAL);
+    }
+    Err("Codex/ChatGPT 客户端未正常退出，已取消重新启动；请先结束当前任务后重试。".into())
+}
+
 #[cfg(target_os = "macos")]
 fn launch_macos_codex_app(app: &MacosCodexApp) -> Result<(), String> {
-    let deadline = Instant::now()
-        .checked_add(CODEX_DESKTOP_COMMAND_TIMEOUT)
-        .ok_or_else(|| "创建 Codex/ChatGPT 启动超时时间失败".to_string())?;
     let bundle_path = app
         .bundle_path
         .to_str()
-        .ok_or_else(|| "Codex/ChatGPT 客户端路径不是有效文本".to_string())?;
-    let output = run_program_with_timeout(
-        Path::new("/usr/bin/open"),
-        &["-a", bundle_path],
-        Some(deadline),
-        CODEX_DESKTOP_COMMAND_TIMEOUT,
-    )
-    .ok_or_else(|| "启动 Codex/ChatGPT 客户端失败或超时".to_string())?;
-    if output.status.success() {
-        return Ok(());
+        .ok_or("Codex 客户端路径不是有效文本")?;
+    let mut last_error = "未确认 Codex 客户端已启动".to_owned();
+    for attempt in 0..2 {
+        let output = desktop_command_output(
+            Path::new("/usr/bin/open"),
+            &["-n", "-a", bundle_path],
+            CODEX_DESKTOP_COMMAND_TIMEOUT,
+        );
+        let accepted = output.as_ref().is_ok_and(|output| output.status.success());
+        if let Ok(output) = &output {
+            if !output.status.success() {
+                let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+                if !message.is_empty() {
+                    last_error = message;
+                }
+            }
+        } else if let Err(error) = output {
+            last_error = error;
+        }
+        // LaunchServices can acknowledge a launch before a process appears,
+        // or report a stale quit/launch error after the new process starts.
+        let deadline = Instant::now()
+            + if accepted {
+                CODEX_DESKTOP_QUIT_TIMEOUT
+            } else {
+                Duration::from_millis(750)
+            };
+        let mut observed = None;
+        while Instant::now() < deadline {
+            let pids = match macos_main_process_ids(&app.executable_path, Some(deadline)) {
+                Ok(pids) => pids,
+                Err(_) if Instant::now() >= deadline => break,
+                Err(error) => return Err(error),
+            };
+            if !pids.is_empty() {
+                let (previous, since) =
+                    observed.get_or_insert_with(|| (pids.clone(), Instant::now()));
+                if *previous == pids && since.elapsed() >= Duration::from_millis(200) {
+                    return Ok(());
+                }
+                if *previous != pids {
+                    *previous = pids;
+                    *since = Instant::now();
+                }
+            } else {
+                observed = None;
+            }
+            thread::sleep(CODEX_DESKTOP_POLL_INTERVAL);
+        }
+        if accepted || attempt == 1 {
+            break;
+        }
+        // Retry only an unacknowledged launch with no surviving main process.
+        // Never open a second instance after LaunchServices confirmed one.
     }
-    let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    Err(if message.is_empty() {
-        "启动 Codex/ChatGPT 客户端失败".to_string()
-    } else {
-        format!("启动 Codex/ChatGPT 客户端失败: {message}")
-    })
+    Err(format!("启动 Codex/ChatGPT 未完成：{last_error}"))
+}
+
+// Narrow helpers shared with the opt-in locale launcher. They do not quit or
+// launch anything until the explicit locale apply command calls them.
+#[cfg(target_os = "macos")]
+pub(crate) fn locale_platform_command(program: &Path, args: &[&str]) -> Result<Output, String> {
+    let deadline = Instant::now() + CODEX_DESKTOP_COMMAND_TIMEOUT;
+    let output =
+        run_program_with_timeout(program, args, Some(deadline), CODEX_DESKTOP_COMMAND_TIMEOUT)
+            .ok_or("客户端操作超时，未继续应用语言兼容。")?;
+    if !output.status.success() {
+        return Err("客户端操作未完成，请检查官方客户端状态后重试。".into());
+    }
+    Ok(output)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn locale_desktop_app() -> Result<(PathBuf, PathBuf, String, String, String), String> {
+    let deadline = Some(Instant::now() + CODEX_DESKTOP_COMMAND_TIMEOUT);
+    let apps: Vec<_> = macos_codex_apps(deadline)?
+        .into_iter()
+        .filter(|app| {
+            matches!(
+                app.bundle_id.as_str(),
+                "com.openai.codex" | "com.openai.codex.beta"
+            )
+        })
+        .collect();
+    let mut running = Vec::new();
+    for app in &apps {
+        if !macos_main_process_ids(&app.executable_path, deadline)?.is_empty() {
+            running.push(app);
+        }
+    }
+    if running.len() > 1 {
+        return Err("检测到多个官方客户端实例，请先保留一个实例再应用界面语言。".into());
+    }
+    let app = running
+        .first()
+        .copied()
+        .or_else(|| apps.first())
+        .ok_or("未找到官方 Codex 客户端")?;
+    let version = macos_info_plist_version(&app.bundle_path).unwrap_or_else(|| "unknown".into());
+    Ok((
+        app.bundle_path.clone(),
+        app.executable_path.clone(),
+        app.bundle_id.clone(),
+        app.app_name.clone(),
+        version,
+    ))
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn locale_desktop_pids(executable: &Path) -> Result<Vec<u32>, String> {
+    macos_main_process_ids(
+        executable,
+        Some(Instant::now() + CODEX_DESKTOP_COMMAND_TIMEOUT),
+    )
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn locale_quit_desktop(executable: &Path, bundle_id: &str) -> Result<(), String> {
+    if !MACOS_CODEX_BUNDLE_IDS.contains(&bundle_id) {
+        return Err("不支持的客户端身份".into());
+    }
+    if locale_desktop_pids(executable)?.is_empty() {
+        return wait_macos_stopped(executable);
+    }
+    let requested = locale_platform_command(
+        Path::new("/usr/bin/osascript"),
+        &[
+            "-e",
+            &format!("tell application id \"{bundle_id}\" to quit"),
+        ],
+    );
+    // Apple Events may lose the connection while the application exits. An
+    // error from osascript is not proof that the exact selected process lives.
+    match wait_macos_stopped(executable) {
+        Ok(()) => Ok(()),
+        Err(error) => Err(requested
+            .err()
+            .map(|request| format!("{request}；{error}"))
+            .unwrap_or(error)),
+    }
 }
 
 #[cfg(target_os = "macos")]
 pub fn restart_codex_desktop() -> Result<(String, bool), String> {
-    let detection_deadline = Instant::now()
-        .checked_add(CODEX_DESKTOP_COMMAND_TIMEOUT)
-        .ok_or_else(|| "创建 Codex/ChatGPT 检测超时时间失败".to_string())?;
-    let apps = macos_codex_apps(Some(detection_deadline))?;
+    let detection_deadline = Some(Instant::now() + CODEX_DESKTOP_COMMAND_TIMEOUT);
+    let apps = macos_codex_apps(detection_deadline)?;
     let mut first_installed = None;
-    let mut running_app = None;
+    let mut running = Vec::new();
     for app in apps {
-        let is_running =
-            !macos_main_process_ids(&app.executable_path, Some(detection_deadline))?.is_empty();
-        if is_running {
-            running_app = Some(app);
-            break;
-        }
-        if first_installed.is_none() {
+        if !macos_main_process_ids(&app.executable_path, detection_deadline)?.is_empty() {
+            running.push(app);
+        } else if first_installed.is_none() {
             first_installed = Some(app);
         }
     }
-    let was_running = running_app.is_some();
-    let app = running_app
+    if running.len() > 1 {
+        return Err("检测到多个官方 Codex 客户端，请先保留一个再重启。".into());
+    }
+    let was_running = !running.is_empty();
+    let app = running
+        .pop()
         .or(first_installed)
-        .ok_or_else(|| "未找到可重启的 Codex/ChatGPT 桌面客户端".to_string())?;
-    if !was_running {
-        launch_macos_codex_app(&app)?;
-        return Ok((app.app_name, false));
-    }
-
-    let quit_script = format!("tell application id \"{}\" to quit", app.bundle_id);
-    let command_deadline = Instant::now()
-        .checked_add(CODEX_DESKTOP_COMMAND_TIMEOUT)
-        .ok_or_else(|| "创建 Codex/ChatGPT 退出命令超时时间失败".to_string())?;
-    let output = run_program_with_timeout(
-        Path::new("/usr/bin/osascript"),
-        &["-e", quit_script.as_str()],
-        Some(command_deadline),
-        CODEX_DESKTOP_COMMAND_TIMEOUT,
-    )
-    .ok_or_else(|| "请求 Codex/ChatGPT 客户端正常退出失败或超时".to_string())?;
-    if !output.status.success() {
-        let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(if message.is_empty() {
-            "请求 Codex/ChatGPT 客户端正常退出失败".to_string()
-        } else {
-            format!("请求 Codex/ChatGPT 客户端正常退出失败: {message}")
-        });
-    }
-
-    let quit_deadline = Instant::now()
-        .checked_add(CODEX_DESKTOP_QUIT_TIMEOUT)
-        .ok_or_else(|| "创建 Codex/ChatGPT 退出等待时间失败".to_string())?;
-    loop {
-        if macos_main_process_ids(&app.executable_path, Some(quit_deadline))?.is_empty() {
-            break;
-        }
-        if Instant::now() >= quit_deadline {
-            return Err("Codex/ChatGPT 客户端未在限定时间内正常退出，已取消重新启动".to_string());
-        }
-        thread::sleep(CODEX_DESKTOP_POLL_INTERVAL);
-    }
-
+        .ok_or("未找到可重启的 Codex 客户端")?;
+    locale_quit_desktop(&app.executable_path, &app.bundle_id)?;
     launch_macos_codex_app(&app)?;
-    Ok((app.app_name, true))
+    Ok((app.app_name, was_running))
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -913,7 +1029,7 @@ fn macos_app_version(_deadline: Option<Instant>) -> Option<String> {
     None
 }
 
-#[cfg(any(target_os = "windows", test))]
+#[cfg(test)]
 fn parse_windows_restart_result(output: &str) -> Option<(String, bool)> {
     output.lines().rev().find_map(|line| {
         let payload = line
@@ -934,7 +1050,7 @@ fn parse_windows_restart_result(output: &str) -> Option<(String, bool)> {
     })
 }
 
-#[cfg(any(target_os = "windows", test))]
+#[cfg(test)]
 fn windows_restart_script() -> String {
     let identities = WINDOWS_CODEX_PACKAGE_IDENTITIES
         .iter()
@@ -1026,35 +1142,7 @@ $runningFlag = if ($wasRunning) { '1' } else { '0' }
 
 #[cfg(target_os = "windows")]
 pub fn restart_codex_desktop() -> Result<(String, bool), String> {
-    let script = windows_restart_script();
-    let timeout = CODEX_DESKTOP_QUIT_TIMEOUT + CODEX_DESKTOP_COMMAND_TIMEOUT;
-    let deadline = Instant::now()
-        .checked_add(timeout)
-        .ok_or_else(|| "创建 Codex/ChatGPT 重启超时时间失败".to_string())?;
-    let output = run_program_with_timeout(
-        Path::new("powershell.exe"),
-        &[
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            script.as_str(),
-        ],
-        Some(deadline),
-        timeout,
-    )
-    .ok_or_else(|| "重启 Codex/ChatGPT 客户端失败或超时".to_string())?;
-    if !output.status.success() {
-        let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(if message.is_empty() {
-            "重启 Codex/ChatGPT 客户端失败".to_string()
-        } else {
-            format!("重启 Codex/ChatGPT 客户端失败: {message}")
-        });
-    }
-    parse_windows_restart_result(&String::from_utf8_lossy(&output.stdout))
-        .ok_or_else(|| "无法确认 Codex/ChatGPT 客户端的重启结果".to_string())
+    desktop_windows::restart()
 }
 
 #[cfg(target_os = "windows")]

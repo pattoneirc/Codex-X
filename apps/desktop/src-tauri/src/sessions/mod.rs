@@ -31,3 +31,56 @@ pub(crate) use storage::{
 };
 pub(crate) use sync::{session_sync_status_inner, sync_sessions_provider_inner};
 pub(crate) use types::{SessionSyncResult, SessionSyncStatus};
+
+/// Serialize operations that can restart the official client with session
+/// synchronization and deletion, including callers from other windows or IPC.
+/// Provider activation remains independent of this maintenance lock.
+pub(crate) fn with_session_maintenance<T>(
+    codex_dir: &std::path::Path,
+    operation: impl FnOnce() -> crate::error::Result<T>,
+) -> crate::error::Result<T> {
+    let _guard = sync::acquire_session_maintenance_lock(codex_dir)?;
+    operation()
+}
+
+#[cfg(test)]
+mod maintenance_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn maintenance_conflict_never_executes_callback_and_release_allows_retry() {
+        let directory = tempfile::tempdir().unwrap();
+        let held = sync::acquire_session_maintenance_lock(directory.path()).unwrap();
+        let called = Cell::new(false);
+        let error = with_session_maintenance(directory.path(), || {
+            called.set(true);
+            Ok(())
+        })
+        .expect_err("another session operation must block the callback");
+        assert!(!called.get());
+        assert!(error.to_string().contains("会话维护正在进行"));
+        drop(held);
+        let result = with_session_maintenance(directory.path(), || {
+            called.set(true);
+            Ok(17)
+        })
+        .unwrap();
+        assert!(called.get());
+        assert_eq!(result, 17);
+        let _available = sync::acquire_session_maintenance_lock(directory.path()).unwrap();
+    }
+
+    #[test]
+    fn maintenance_guard_releases_when_callback_returns_an_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let error = with_session_maintenance(directory.path(), || {
+            Err::<(), _>(crate::error::CodexxError::Config(
+                "fixture operation failed".into(),
+            ))
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("fixture operation failed"));
+        let _available = sync::acquire_session_maintenance_lock(directory.path()).unwrap();
+    }
+}

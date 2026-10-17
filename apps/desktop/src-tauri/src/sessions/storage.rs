@@ -1,5 +1,9 @@
 use super::global_state::normalize_workspace_path;
-use super::rollout_stream::{read_first_meta, scan_rollout_stream};
+use super::rollout_stream::{
+    decoded_rollout_reader, ensure_current_rollout_representation, inspect_rollout_stream,
+    is_compressed_rollout, logical_rollout_path, read_first_meta, resolved_rollout_path,
+    scan_rollout_stream,
+};
 use super::types::{RolloutScan, SessionFileChange, SessionPreview, SqliteScan};
 use crate::error::{CodexxError, Result};
 use crate::file_io::{io_err, parse_toml_document, read_to_string_if_exists};
@@ -50,7 +54,10 @@ pub(super) fn current_model_provider(codex_dir: &Path, explicit: Option<String>)
 fn is_rollout_file(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"))
+        .is_some_and(|name| {
+            name.starts_with("rollout-")
+                && (name.ends_with(".jsonl") || name.ends_with(".jsonl.zst"))
+        })
 }
 
 pub(super) fn rollout_filename_matches_id(path: &Path, id: &str) -> bool {
@@ -80,6 +87,30 @@ pub(super) fn is_canonical_rollout_storage_path(codex_dir: &Path, path: &Path) -
         .any(|root| path.starts_with(root))
 }
 
+fn missing_rollout_reference_failure(codex_dir: &Path, path: &Path, thread_id: &str) -> String {
+    let mut archived = Vec::new();
+    collect_rollout_paths(
+        &codex_dir.join("archived_sessions"),
+        &mut archived,
+        &mut Vec::new(),
+    );
+    let logical_name = logical_rollout_path(path);
+    archived.sort();
+    if let Some(archived) = archived.into_iter().find(|candidate| {
+        logical_rollout_path(candidate).file_name() == logical_name.file_name()
+            && read_rollout_identity(candidate).is_ok_and(|identity| {
+                identity.payload.id.as_deref().map(str::trim) == Some(thread_id)
+            })
+    }) {
+        return format!(
+            "活动 SQLite 引用的会话文件已位于归档目录，活动索引与归档状态不一致，未自动恢复为活动会话: {} [线程 {thread_id}；归档文件 {}]",
+            path.display(), archived.display());
+    }
+    format!(
+        "活动 SQLite 引用的会话文件不存在（原文件及同名压缩文件均缺失，无法确认是否已删除）: {} [线程 {thread_id}]",
+        path.display())
+}
+
 fn referenced_rollout_paths(
     codex_dir: &Path,
     rollout_paths_by_thread_id: &HashMap<String, String>,
@@ -87,12 +118,30 @@ fn referenced_rollout_paths(
     failures: &mut Vec<String>,
 ) -> HashMap<PathBuf, HashSet<String>> {
     let mut referenced = HashMap::<PathBuf, HashSet<String>>::new();
-    for (thread_id, value) in rollout_paths_by_thread_id {
+    let mut ordered = rollout_paths_by_thread_id.iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| left.0.cmp(right.0));
+    for (thread_id, value) in ordered {
         let raw = PathBuf::from(value.trim());
         let path = if raw.is_absolute() {
             raw
         } else {
             codex_dir.join(raw)
+        };
+        let path = match resolved_rollout_path(&path) {
+            Ok(path) => path,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                failures.push(missing_rollout_reference_failure(
+                    codex_dir, &path, thread_id,
+                ));
+                continue;
+            }
+            Err(error) => {
+                failures.push(format!(
+                    "无法检查活动会话文件: {} ({error})",
+                    path.display()
+                ));
+                continue;
+            }
         };
         let metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
@@ -159,6 +208,34 @@ fn referenced_rollout_paths(
     referenced
 }
 
+/// The full provider scan below validates every eligible log. This index pass
+/// only needs to check its explicit references and first-record identities;
+/// creating and parsing complete snapshots here would duplicate all log IO.
+pub(super) fn validate_rollout_references(
+    codex_dir: &Path,
+    rollout_paths_by_thread_id: &HashMap<String, String>,
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    let referenced =
+        referenced_rollout_paths(codex_dir, rollout_paths_by_thread_id, false, &mut failures);
+    let mut referenced = referenced.into_iter().collect::<Vec<_>>();
+    referenced.sort_by(|left, right| left.0.cmp(&right.0));
+    for (path, expected) in referenced {
+        match read_rollout_identity(&path) {
+            Ok(identity)
+                if expected.len() == 1
+                    && expected
+                        .contains(identity.payload.id.as_deref().unwrap_or_default().trim()) => {}
+            Ok(_) => failures.push(format!(
+                "活动 SQLite 引用的会话文件与线程 ID 不一致: {}",
+                path.display()
+            )),
+            Err(failure) => failures.push(failure),
+        }
+    }
+    failures
+}
+
 fn collect_rollout_paths(root: &Path, out: &mut Vec<PathBuf>, failures: &mut Vec<String>) {
     let entries = match fs::read_dir(root) {
         Ok(entries) => entries,
@@ -205,7 +282,7 @@ fn is_locked_io_error(error: &std::io::Error) -> bool {
 }
 
 pub(crate) fn scan_rollouts(codex_dir: &Path, target_provider: &str) -> Result<RolloutScan> {
-    scan_rollouts_with_thread_filter(codex_dir, target_provider, None, None, true, None, false)
+    scan_rollouts_with_thread_filter(codex_dir, target_provider, None, true, None, false, true)
 }
 
 pub(super) fn scan_provider_rollouts(
@@ -217,43 +294,42 @@ pub(super) fn scan_provider_rollouts(
     scan_rollouts_with_thread_filter(
         codex_dir,
         target_provider,
-        None,
         Some(authoritative_rollout_paths),
         false,
         Some(excluded_thread_ids),
         true,
+        true,
     )
 }
 
-pub(super) fn scan_rollouts_for_thread_ids(
+pub(super) fn inspect_provider_rollouts(
     codex_dir: &Path,
     target_provider: &str,
-    thread_ids: &HashSet<String>,
-    rollout_paths_by_thread_id: &HashMap<String, String>,
+    excluded_thread_ids: &HashSet<String>,
+    authoritative_rollout_paths: &HashMap<String, String>,
 ) -> Result<RolloutScan> {
     scan_rollouts_with_thread_filter(
         codex_dir,
         target_provider,
-        Some(thread_ids),
-        Some(rollout_paths_by_thread_id),
+        Some(authoritative_rollout_paths),
         false,
-        None,
+        Some(excluded_thread_ids),
         true,
+        false,
     )
 }
 
 fn scan_rollouts_with_thread_filter(
     codex_dir: &Path,
     target_provider: &str,
-    allowed_thread_ids: Option<&HashSet<String>>,
     rollout_paths_by_thread_id: Option<&HashMap<String, String>>,
     include_archived_storage: bool,
     excluded_thread_ids: Option<&HashSet<String>>,
     exclude_source_marked_subagents: bool,
+    stage_changes: bool,
 ) -> Result<RolloutScan> {
     let mut paths = Vec::new();
     let mut scan = RolloutScan::default();
-    let mut referenced = HashMap::new();
     collect_rollout_paths(
         &codex_dir.join("sessions"),
         &mut paths,
@@ -266,47 +342,26 @@ fn scan_rollouts_with_thread_filter(
             &mut scan.scan_failures,
         );
     }
+    // Codex may leave a compressed history beside a newly expanded current
+    // log. Resolve the pair once and never synchronize both representations.
+    paths.retain(|path| {
+        !is_compressed_rollout(path) || fs::symlink_metadata(logical_rollout_path(path)).is_err()
+    });
     paths.sort();
     scan.discovered_rollout_files = paths.len();
     if let Some(excluded_thread_ids) = excluded_thread_ids {
         paths.retain(|path| {
+            if let Some(id) = rollout_filename_thread_id(path) {
+                return !excluded_thread_ids.contains(id);
+            }
             !excluded_thread_ids
                 .iter()
                 .any(|id| rollout_filename_matches_id(path, id))
         });
     }
-    if let Some(allowed_thread_ids) = allowed_thread_ids {
-        let empty_rollout_paths = HashMap::new();
-        let rollout_paths_by_thread_id = rollout_paths_by_thread_id.unwrap_or(&empty_rollout_paths);
-        let explicitly_referenced_thread_ids = rollout_paths_by_thread_id
-            .keys()
-            .filter(|id| allowed_thread_ids.contains(*id))
-            .cloned()
-            .collect::<HashSet<_>>();
-        referenced = referenced_rollout_paths(
-            codex_dir,
-            rollout_paths_by_thread_id,
-            include_archived_storage,
-            &mut scan.scan_failures,
-        );
-        paths.retain(|path| {
-            let is_unreferenced_thread_rollout = allowed_thread_ids
-                .iter()
-                .filter(|id| !explicitly_referenced_thread_ids.contains(*id))
-                .any(|id| rollout_filename_matches_id(path, id));
-            is_unreferenced_thread_rollout
-                || path
-                    .canonicalize()
-                    .is_ok_and(|canonical| referenced.contains_key(&canonical))
-        });
-    }
     scan.rollout_files = paths.len();
 
     for path in paths {
-        let expected_thread_ids = path
-            .canonicalize()
-            .ok()
-            .and_then(|canonical| referenced.get(&canonical));
         let mut rollout_file = match fs::File::open(&path) {
             Ok(file) => file,
             Err(error) => {
@@ -325,15 +380,6 @@ fn scan_rollouts_with_thread_filter(
             }
         };
         let identity_id = identity.payload.id.as_deref().unwrap_or_default().trim();
-        if expected_thread_ids
-            .is_some_and(|expected| expected.len() != 1 || !expected.contains(identity_id))
-        {
-            scan.scan_failures.push(format!(
-                "活动 SQLite 引用的会话文件与线程 ID 不一致: {}",
-                path.display()
-            ));
-            continue;
-        }
         let authoritative_identity = rollout_paths_by_thread_id.is_none_or(|authority| {
             is_authoritative_rollout(codex_dir, &path, identity_id, authority)
         });
@@ -345,12 +391,14 @@ fn scan_rollouts_with_thread_filter(
                 continue;
             }
         }
-        if excluded_thread_ids.is_some_and(|excluded| excluded.contains(identity_id))
-            || allowed_thread_ids.is_some_and(|allowed| !allowed.contains(identity_id))
-        {
+        if excluded_thread_ids.is_some_and(|excluded| excluded.contains(identity_id)) {
             continue;
         }
-        let streamed = match scan_rollout_stream(&mut rollout_file, &path, target_provider) {
+        let streamed = match if stage_changes {
+            scan_rollout_stream(&mut rollout_file, &path, target_provider)
+        } else {
+            inspect_rollout_stream(&mut rollout_file, &path, target_provider)
+        } {
             Ok(streamed) => streamed,
             Err(error) => {
                 scan.scan_failures.push(format!(
@@ -385,10 +433,12 @@ fn scan_rollouts_with_thread_filter(
         {
             scan.cwd_by_thread_id.insert(thread_id.clone(), cwd);
         }
-        if let Some(snapshot) = streamed.staged {
+        if streamed.mismatch_count > 0 {
             scan.mismatched_rollouts += 1;
             scan.mismatched_session_meta += streamed.mismatch_count;
             scan.mismatched_thread_ids.insert(thread_id);
+        }
+        if let Some(snapshot) = streamed.staged {
             scan.changes.push(SessionFileChange {
                 path,
                 original_text: String::new(),
@@ -426,6 +476,7 @@ fn rollout_file_is_open(_path: &Path) -> bool {
 }
 
 fn ensure_rollout_snapshot_unchanged(path: &Path, expected: &[u8; 32]) -> Result<()> {
+    ensure_current_rollout_representation(path)?;
     if hash_rollout_file(path).map_err(|error| io_err(path, error))? == *expected {
         Ok(())
     } else {
@@ -1273,12 +1324,15 @@ fn read_rollout_identity_from_reader<R: Read>(
     reader: R,
     path: &Path,
 ) -> std::result::Result<RolloutIdentityRecord, String> {
-    let first = read_first_meta(reader, path).map_err(|error| {
-        format!(
-            "会话文件包含无法解析的 JSON 或无法读取会话文件来源信息: {} ({error})",
-            path.display()
-        )
-    })?;
+    let first = decoded_rollout_reader(reader, path)
+        .map_err(|error| io_err(path, error))
+        .and_then(|reader| read_first_meta(reader, path))
+        .map_err(|error| {
+            format!(
+                "会话文件包含无法解析的 JSON 或无法读取会话文件来源信息: {} ({error})",
+                path.display()
+            )
+        })?;
     let record = RolloutIdentityRecord {
         kind: "session_meta".into(),
         payload: RolloutIdentityPayload {
@@ -1330,8 +1384,8 @@ fn is_authoritative_rollout(
     } else {
         codex_dir.join(raw)
     };
-    resolved
-        .canonicalize()
+    resolved_rollout_path(&resolved)
+        .and_then(|path| path.canonicalize())
         .ok()
         .zip(path.canonicalize().ok())
         .is_some_and(|(expected, actual)| expected == actual)

@@ -18,6 +18,7 @@ mod app_update;
 mod app_update_channel;
 mod backups;
 mod ccswitch;
+mod codex_language;
 mod config_health;
 mod config_migration;
 mod constants;
@@ -30,6 +31,7 @@ mod live_config;
 mod paths;
 mod platform;
 mod prompts;
+mod provider_balance;
 mod providers;
 mod remote;
 mod sessions;
@@ -576,6 +578,67 @@ async fn open_codex_config_file(config_dir: Option<String>) -> Result<()> {
 }
 
 #[tauri::command]
+async fn refresh_provider_balance(
+    config_dir: Option<String>,
+    source: String,
+    provider_id: String,
+) -> Result<provider_balance::ProviderBalanceResult> {
+    tauri::async_runtime::spawn_blocking(move || {
+        provider_balance::refresh_provider_balance_inner(config_dir, source, provider_id)
+    })
+    .await
+    .map_err(|_| CodexxError::Config("刷新供应商余额失败，请稍后重试。".into()))?
+}
+
+#[tauri::command]
+async fn get_provider_balances(
+    config_dir: Option<String>,
+) -> Result<Vec<provider_balance::ProviderBalanceResult>> {
+    tauri::async_runtime::spawn_blocking(move || {
+        provider_balance::get_provider_balances_inner(config_dir)
+    })
+    .await
+    .map_err(|_| CodexxError::Config("读取供应商余额失败，请稍后重试。".into()))?
+}
+
+#[tauri::command]
+async fn get_codex_language_status(
+    config_dir: Option<String>,
+) -> Result<codex_language::LanguageStatus> {
+    tauri::async_runtime::spawn_blocking(move || codex_language::get_status(config_dir))
+        .await
+        .map_err(|_| CodexxError::Config("读取 Codex 界面语言状态失败，请重试。".into()))?
+}
+
+#[tauri::command]
+async fn save_codex_language_preferences(
+    config_dir: Option<String>,
+    locale: codex_language::Locale,
+    enabled: bool,
+) -> Result<codex_language::LanguageStatus> {
+    tauri::async_runtime::spawn_blocking(move || {
+        codex_language::save_preferences(config_dir, locale, enabled)
+    })
+    .await
+    .map_err(|_| CodexxError::Config("保存 Codex 界面语言偏好失败，请重试。".into()))?
+}
+
+#[tauri::command]
+async fn apply_codex_language_preferences(
+    config_dir: Option<String>,
+    restore: bool,
+) -> Result<codex_language::LanguageStatus> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let codex_dir = resolve_codex_dir(config_dir.clone())?;
+        sessions::with_session_maintenance(&codex_dir, || {
+            codex_language::apply(config_dir, restore)
+        })
+    })
+    .await
+    .map_err(|_| CodexxError::Config("应用 Codex 界面语言失败，请查看状态后重试。".into()))?
+}
+
+#[tauri::command]
 async fn get_session_sync_status(
     config_dir: Option<String>,
     target_provider: Option<String>,
@@ -660,11 +723,18 @@ async fn get_about_info(config_dir: Option<String>) -> Result<AboutInfo> {
 }
 
 #[tauri::command]
-async fn restart_codex_desktop() -> std::result::Result<CodexDesktopRestartResult, String> {
-    let (app_name, was_running) =
-        tauri::async_runtime::spawn_blocking(platform::restart_codex_desktop)
-            .await
-            .map_err(|error| format!("重启 Codex 桌面客户端失败: {error}"))??;
+async fn restart_codex_desktop(
+    config_dir: Option<String>,
+) -> std::result::Result<CodexDesktopRestartResult, String> {
+    let (app_name, was_running) = tauri::async_runtime::spawn_blocking(move || {
+        let codex_dir = resolve_codex_dir(config_dir.clone()).map_err(|e| e.to_string())?;
+        sessions::with_session_maintenance(&codex_dir, || {
+            codex_language::restart_client(config_dir)
+        })
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|error| format!("重启 Codex 桌面客户端失败: {error}"))??;
     Ok(CodexDesktopRestartResult {
         app_name,
         was_running,
@@ -1879,6 +1949,11 @@ pub fn run() {
             check_codex_config,
             repair_codex_config,
             open_codex_config_file,
+            refresh_provider_balance,
+            get_provider_balances,
+            get_codex_language_status,
+            save_codex_language_preferences,
+            apply_codex_language_preferences,
             get_session_sync_status,
             sync_sessions_provider,
             delete_codex_sessions,

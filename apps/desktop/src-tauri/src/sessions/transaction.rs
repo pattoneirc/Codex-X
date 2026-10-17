@@ -2,6 +2,7 @@ use super::catalog::{
     apply_catalog_updates, catalog_columns, create_catalog_rollback_tables,
     restore_catalog_updates, CatalogRepairThread,
 };
+use super::rollout_stream::ensure_current_rollout_representation;
 use super::storage::{
     apply_session_changes_with_hook, hash_rollout_file, restore_session_changes,
     rollout_path_has_syncable_identity, rollout_text_is_internal, sqlite_subagent_thread_ids,
@@ -492,6 +493,7 @@ fn expected_rollout_hashes(rollouts: &RolloutScan) -> Result<HashMap<PathBuf, [u
 
 fn validate_rollout_snapshots(expected: &HashMap<PathBuf, [u8; 32]>) -> Result<()> {
     for (path, expected_hash) in expected {
+        ensure_current_rollout_representation(path)?;
         if hash_rollout_file(path).map_err(|error| io_err(path, error))? != *expected_hash {
             return Err(CodexxError::Config(format!(
                 "会话文件已发生变化，已停止同步；请重新检查会话：{}",

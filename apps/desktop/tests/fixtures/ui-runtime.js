@@ -28,6 +28,39 @@
   let transferMode = "success";
   let lastTransfer = null;
   let existingImportAvailable = true;
+  // Independent of the persisted provider fixture: language controls only model
+  // the current page's memory, never a real Codex process or configuration.
+  let codexLanguageEnabled = true;
+  let codexLanguagePendingEnabled = null;
+  let codexLanguageMode = "normal";
+
+  function codexLanguageStatus() {
+    return {
+      locale: codexLanguageEnabled ? "zh-CN" : "auto",
+      enabled: codexLanguageEnabled,
+      pendingEnabled: codexLanguagePendingEnabled,
+      supported: true,
+      appName: "ChatGPT",
+      appVersion: "fixture",
+      phase: codexLanguageEnabled ? "active" : "inactive",
+      message: "",
+      readyPages: 0,
+      restoreAvailable: false,
+    };
+  }
+
+  function setCodexLanguageActual(enabled) {
+    if (typeof enabled !== "boolean") throw new Error("Unknown fixture language state");
+    codexLanguageEnabled = enabled;
+    codexLanguagePendingEnabled = null;
+    render();
+  }
+
+  function setCodexLanguageMode(mode) {
+    if (!["normal", "save-error", "apply-error"].includes(mode)) throw new Error("Unknown fixture language mode");
+    codexLanguageMode = mode;
+    render();
+  }
   const defaultRoutingSettings = () => ({ version: 2, routerEnabled: false, takeoverEnabled: false, autoFailoverEnabled: false,
     listenAddress: "127.0.0.1", listenPort: 15721, providerIds: [], maxRetries: 3, streamingFirstByteTimeout: 60,
     streamingIdleTimeout: 120, nonStreamingTimeout: 600, circuitFailureThreshold: 4, circuitSuccessThreshold: 2,
@@ -277,6 +310,8 @@
   function snapshot() {
     return {
       startupWizardSeen: localStorage.getItem("codexx.startupWizardSeen"),
+      codexLanguage: codexLanguageStatus(),
+      codexLanguageMode,
       transferMode, lastTransfer,
       failoverSettings: clone(failoverSettings), failoverMode,
       pendingSync: pending.sync.length,
@@ -838,6 +873,20 @@
 
   async function dispatch(command, args) {
     switch (command) {
+      case "get_codex_language_status": return codexLanguageStatus();
+      case "save_codex_language_preferences": {
+        if (codexLanguageMode === "save-error") throw new Error("Fixture：语言设置保存失败，当前配置未改变");
+        if (typeof args.enabled !== "boolean" || args.locale !== (args.enabled ? "zh-CN" : "auto")) throw new Error("Fixture：语言偏好参数无效");
+        codexLanguagePendingEnabled = args.enabled === codexLanguageEnabled ? null : args.enabled;
+        return codexLanguageStatus();
+      }
+      case "apply_codex_language_preferences": {
+        if (codexLanguageMode === "apply-error") throw new Error("Fixture：语言设置应用失败，尚未重启客户端");
+        if (args.restore === true) throw new Error("Fixture：没有可恢复的语言快照");
+        codexLanguageEnabled = codexLanguagePendingEnabled ?? codexLanguageEnabled;
+        codexLanguagePendingEnabled = null;
+        return codexLanguageStatus();
+      }
       case "get_provider_config_base": {
         if (providerBaseReadFailure) throw new Error("Fixture：无法读取供应商配置底稿");
         // Model a legacy route-only file with the official integration snapshot
@@ -1088,6 +1137,8 @@
   window.__CODEX_X_FIXTURE__ = {
     snapshot,
     loginSecondOfficialAccount,
+    setCodexLanguageActual,
+    setCodexLanguageMode,
     setUsageMode,
     setQuotaMode,
     setProviderOrderMode,
@@ -1109,7 +1160,7 @@
   document.addEventListener("DOMContentLoaded", () => {
     const panel = document.createElement("aside");
     panel.setAttribute("aria-label", "Fixture 控制面板");
-    panel.style.cssText = "position:fixed;left:8px;bottom:8px;z-index:2147483647;width:224px;max-width:calc(100vw - 16px);box-sizing:border-box;background:#fff;color:#111;border:2px solid #1463d6;border-radius:8px;padding:8px;font:12px monospace;box-shadow:0 2px 8px #0003";
+    panel.style.cssText = "position:fixed;left:8px;bottom:8px;z-index:2147483647;width:224px;max-width:calc(100vw - 16px);max-height:calc(100vh - 16px);overflow:auto;box-sizing:border-box;background:#fff;color:#111;border:2px solid #1463d6;border-radius:8px;padding:8px;font:12px monospace;box-shadow:0 2px 8px #0003";
     const panelBody = document.createElement("details");
     panelBody.open = true;
     const label = document.createElement("summary");
@@ -1137,6 +1188,18 @@
       const option = document.createElement("option"); option.value = value; option.textContent = label; transferSelect.append(option);
     }
     transferSelect.addEventListener("change", () => { transferMode = transferSelect.value; render(); }); controls.append(transferSelect);
+    for (const [text, action] of [
+      ["Fixture：语言外部改为中文", () => setCodexLanguageActual(true)],
+      ["Fixture：语言外部改为自动", () => setCodexLanguageActual(false)],
+      ["Fixture：语言保存失败", () => setCodexLanguageMode("save-error")],
+      ["Fixture：语言应用失败", () => setCodexLanguageMode("apply-error")],
+      ["Fixture：语言恢复正常", () => setCodexLanguageMode("normal")],
+    ]) {
+      const button = document.createElement("button");
+      button.type = "button"; button.textContent = text;
+      button.style.cssText = "font:inherit;padding:5px;border:1px solid #aaa;border-radius:4px;background:#eee;color:#111;cursor:pointer";
+      button.addEventListener("click", action); controls.append(button);
+    }
     for (const [text, mode] of [["Fixture：配置正常", "healthy"], ["Fixture：缺失供应商配置", "missing"], ["Fixture：配置语法错误", "syntax"]]) {
       const button = document.createElement("button");
       button.type = "button"; button.textContent = text;
