@@ -216,14 +216,23 @@ fn run_program_with_timeout(
     deadline: Option<Instant>,
     maximum: Duration,
 ) -> Option<Output> {
+    run_command_with_timeout(program_command(program, args), deadline, maximum)
+        .map(|(_, output)| output)
+}
+
+fn run_command_with_timeout(
+    mut command: Command,
+    deadline: Option<Instant>,
+    maximum: Duration,
+) -> Option<(u32, Output)> {
     let timeout = remaining_timeout(deadline, maximum)?;
     let command_deadline = Instant::now().checked_add(timeout)?;
-    let mut command = program_command(program, args);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = command.spawn().ok()?;
+    let child_id = child.id();
 
     let Some(stdout) = child.stdout.take() else {
         terminate_child(&mut child);
@@ -258,11 +267,14 @@ fn run_program_with_timeout(
     };
     let stdout = receive_output(&stdout_receiver, command_deadline)?;
     let stderr = receive_output(&stderr_receiver, command_deadline)?;
-    Some(Output {
-        status,
-        stdout,
-        stderr,
-    })
+    Some((
+        child_id,
+        Output {
+            status,
+            stdout,
+            stderr,
+        },
+    ))
 }
 
 fn run_program(program: &Path, args: &[&str], deadline: Option<Instant>) -> Option<Output> {
@@ -859,11 +871,24 @@ fn launch_macos_codex_app(app: &MacosCodexApp) -> Result<(), String> {
         .ok_or("Codex 客户端路径不是有效文本")?;
     let mut last_error = "未确认 Codex 客户端已启动".to_owned();
     for attempt in 0..2 {
-        let output = desktop_command_output(
-            Path::new("/usr/bin/open"),
-            &["-n", "-a", bundle_path],
+        let arguments = [
+            "-n".to_owned(),
+            "-a".to_owned(),
+            bundle_path.to_owned(),
+            "--stdin".to_owned(),
+            "/dev/null".to_owned(),
+            "--stdout".to_owned(),
+            "/dev/null".to_owned(),
+            "--stderr".to_owned(),
+            "/dev/null".to_owned(),
+        ];
+        let output = run_command_with_timeout(
+            macos_open_command(&arguments, false),
+            None,
             CODEX_DESKTOP_COMMAND_TIMEOUT,
-        );
+        )
+        .map(|(_, output)| output)
+        .ok_or_else(|| "客户端系统操作超时，未继续重启或连接客户端。".to_owned());
         let accepted = output.as_ref().is_ok_and(|output| output.status.success());
         if let Ok(output) = &output {
             if !output.status.success() {
@@ -914,8 +939,236 @@ fn launch_macos_codex_app(app: &MacosCodexApp) -> Result<(), String> {
     Err(format!("启动 Codex/ChatGPT 未完成：{last_error}"))
 }
 
-// Narrow helpers shared with the opt-in locale launcher. They do not quit or
-// launch anything until the explicit locale apply command calls them.
+// LaunchServices helpers for explicit desktop restart and locale apply.
+// Capability/status inspection never launches or quits an application.
+#[cfg(target_os = "macos")]
+fn macos_open_command(arguments: &[String], explicit_home: bool) -> Command {
+    use std::os::unix::process::CommandExt;
+
+    let mut command = Command::new("/usr/bin/open");
+    command.args(arguments).process_group(0);
+    // LaunchServices inherits `open`'s environment. Keep arbitrary provider
+    // env_key/env_http_headers and proxies, but remove the manager's private
+    // launch identity and Electron/dev injection state. Values are not inspected.
+    for (name, _) in std::env::vars_os() {
+        if name.to_str().is_some_and(|name| {
+            matches!(
+                name,
+                "__CFBundleIdentifier"
+                    | "XPC_SERVICE_NAME"
+                    | "XPC_FLAGS"
+                    | "CODEX_DESKTOP_RELAUNCH_OPEN_EVENTS"
+                    | "ELECTRON_RUN_AS_NODE"
+                    | "NODE_OPTIONS"
+            ) || (explicit_home && name == "CODEX_HOME")
+                || ["CODEX_ELECTRON_", "TAURI_", "CODEXX_"]
+                    .iter()
+                    .any(|prefix| name.starts_with(prefix))
+        }) {
+            command.env_remove(name);
+        }
+    }
+    command
+}
+
+#[cfg(target_os = "macos")]
+fn macos_open_launch_capabilities(require_environment: bool) -> Result<(), String> {
+    static HELP: OnceLock<Result<String, String>> = OnceLock::new();
+    let help = HELP
+        .get_or_init(|| {
+            // `open -h` exits nonzero when showing usage. Only inspect help;
+            // this never opens an application or changes LaunchServices state.
+            let output = desktop_command_output(
+                Path::new("/usr/bin/open"),
+                &["-h"],
+                CODEX_DESKTOP_COMMAND_TIMEOUT,
+            )?;
+            Ok(format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ))
+        })
+        .as_ref()
+        .map_err(Clone::clone)?;
+    if !["--stdin", "--stdout", "--stderr"]
+        .iter()
+        .all(|option| help.contains(option))
+    {
+        return Err(
+            "当前 macOS 的 open 不支持独立标准流；客户端尚未退出，请升级系统后重试。".into(),
+        );
+    }
+    if require_environment && !help.contains("--env") {
+        return Err(
+            "当前 macOS 的 open 不支持独立传入配置目录；客户端尚未退出，请升级系统后重试。".into(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+struct MacosProcessMetadata {
+    parent: u32,
+    group: u32,
+    command: String,
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_metadata(
+    pid: u32,
+    deadline: Option<Instant>,
+) -> Result<MacosProcessMetadata, String> {
+    let pid = pid.to_string();
+    let output = run_program_with_timeout(
+        Path::new("/bin/ps"),
+        &["-ww", "-p", &pid, "-o", "ppid=,pgid=,command="],
+        deadline,
+        CODEX_DESKTOP_COMMAND_TIMEOUT,
+    )
+    .filter(|output| output.status.success())
+    .ok_or("无法确认客户端进程的独立启动身份")?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let text = text.trim();
+    let (parent, rest) = text
+        .split_once(char::is_whitespace)
+        .ok_or("客户端进程身份返回无效")?;
+    let (group, command) = rest
+        .trim_start()
+        .split_once(char::is_whitespace)
+        .ok_or("客户端进程组返回无效")?;
+    Ok(MacosProcessMetadata {
+        parent: parent.parse().map_err(|_| "客户端父进程标识无效")?,
+        group: group.parse().map_err(|_| "客户端进程组标识无效")?,
+        command: command.trim_start().to_owned(),
+    })
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn locale_validate_launch() -> Result<(), String> {
+    macos_open_launch_capabilities(true)?;
+    let own = macos_process_metadata(std::process::id(), None)?;
+    if own.group == 0 {
+        return Err("无法确认 Codex-X 进程组，客户端尚未退出。".into());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn locale_launch_desktop(
+    bundle_path: &Path,
+    executable: &Path,
+    home: &Path,
+    port: Option<u16>,
+) -> Result<u32, String> {
+    macos_open_launch_capabilities(true)?;
+    let bundle = bundle_path.to_str().ok_or("Codex 客户端路径无效")?;
+    let home = home.to_str().ok_or("Codex 配置目录不是有效文本")?;
+    let own_pid = std::process::id();
+    let own_group = macos_process_metadata(own_pid, None)?.group;
+    if own_group == 0 {
+        return Err("无法确认 Codex-X 进程组，未启动客户端。".into());
+    }
+    if !macos_main_process_ids(executable, None)?.is_empty() {
+        return Err("官方客户端已在运行，未另起实例；请完全退出后重试。".into());
+    }
+    let mut arguments = vec![
+        "-n".to_owned(),
+        "-a".to_owned(),
+        bundle.to_owned(),
+        "--env".to_owned(),
+        format!("CODEX_HOME={home}"),
+        "--stdin".to_owned(),
+        "/dev/null".to_owned(),
+        "--stdout".to_owned(),
+        "/dev/null".to_owned(),
+        "--stderr".to_owned(),
+        "/dev/null".to_owned(),
+    ];
+    if let Some(port) = port {
+        arguments.extend([
+            "--args".to_owned(),
+            format!("--remote-debugging-port={port}"),
+            "--remote-debugging-address=127.0.0.1".to_owned(),
+        ]);
+    }
+    // Own and reap only the short-lived `open` client. The GUI is launched by
+    // LaunchServices, never kept as a Child or tied to Codex-X's process group.
+    let (open_pid, output) = run_command_with_timeout(
+        macos_open_command(&arguments, true),
+        None,
+        CODEX_DESKTOP_COMMAND_TIMEOUT,
+    )
+    .ok_or("LaunchServices 启动未完成；未回退到直接运行客户端可执行文件。")?;
+    let mut last_error = if output.status.success() {
+        "LaunchServices 已收到启动请求，尚未确认新的官方主进程。".to_owned()
+    } else {
+        format!(
+            "LaunchServices 未确认启动：{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+    };
+    let deadline = Instant::now() + CODEX_DESKTOP_QUIT_TIMEOUT;
+    let mut observed = None;
+    while Instant::now() < deadline {
+        let pids = match macos_main_process_ids(executable, Some(deadline)) {
+            Ok(pids) => pids,
+            Err(_) if Instant::now() >= deadline => break,
+            Err(error) => return Err(error),
+        };
+        if pids.len() > 1 {
+            return Err("发现多个官方主进程，未连接任何实例；请保留一个后重试。".into());
+        }
+        if let Some(&pid) = pids.first() {
+            let identity = match macos_process_metadata(pid, Some(deadline)) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    last_error = error;
+                    observed = None;
+                    thread::sleep(CODEX_DESKTOP_POLL_INTERVAL);
+                    continue;
+                }
+            };
+            if pid == own_pid
+                || pid == open_pid
+                || identity.parent == own_pid
+                || identity.parent == open_pid
+                || identity.group == 0
+                || identity.group == own_group
+            {
+                return Err(
+                    "官方客户端未独立于 Codex-X 启动，未执行语言兼容连接。请手动打开客户端。"
+                        .into(),
+                );
+            }
+            let matches_executable =
+                parse_macos_main_process_ids(&format!("{pid} {}", identity.command), executable)
+                    .contains(&pid);
+            let matches_port = port.is_none_or(|port| {
+                let flag = format!("--remote-debugging-port={port}");
+                identity.command.split_whitespace().any(|arg| arg == flag)
+            });
+            if matches_executable && matches_port {
+                let (previous, since) = observed.get_or_insert_with(|| (pid, Instant::now()));
+                if *previous == pid && since.elapsed() >= Duration::from_millis(200) {
+                    return Ok(pid);
+                }
+                if *previous != pid {
+                    *previous = pid;
+                    *since = Instant::now();
+                }
+            } else {
+                observed = None;
+                last_error = "新的官方进程未确认所请求的启动参数，未连接该实例。".into();
+            }
+        } else {
+            observed = None;
+        }
+        thread::sleep(CODEX_DESKTOP_POLL_INTERVAL);
+    }
+    Err(last_error)
+}
+
 #[cfg(target_os = "macos")]
 pub(crate) fn locale_platform_command(program: &Path, args: &[&str]) -> Result<Output, String> {
     let deadline = Instant::now() + CODEX_DESKTOP_COMMAND_TIMEOUT;
@@ -1019,6 +1272,7 @@ pub fn restart_codex_desktop() -> Result<(String, bool), String> {
         .pop()
         .or(first_installed)
         .ok_or("未找到可重启的 Codex 客户端")?;
+    macos_open_launch_capabilities(false)?;
     locale_quit_desktop(&app.executable_path, &app.bundle_id)?;
     launch_macos_codex_app(&app)?;
     Ok((app.app_name, was_running))

@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 static REAPED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+#[cfg(any(not(target_os = "macos"), test))]
 fn process_reaper() -> Result<&'static std::sync::mpsc::Sender<std::process::Child>, String> {
     static REAPER: std::sync::OnceLock<
         Result<std::sync::mpsc::Sender<std::process::Child>, String>,
@@ -39,7 +40,14 @@ fn process_reaper() -> Result<&'static std::sync::mpsc::Sender<std::process::Chi
 }
 
 pub(crate) fn prepare_launch() -> Result<(), String> {
-    process_reaper().map(|_| ())
+    #[cfg(target_os = "macos")]
+    {
+        crate::platform::locale_validate_launch()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        process_reaper().map(|_| ())
+    }
 }
 
 #[derive(Clone)]
@@ -155,7 +163,12 @@ pub(crate) fn validate_launch(app: &DesktopApp, home: &Path) -> Result<(), Strin
     {
         crate::platform::desktop_windows::validate_launch(&windows_app(app), home)
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (app, home);
+        crate::platform::locale_validate_launch()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = (app, home);
         Ok(())
@@ -221,11 +234,15 @@ pub(crate) fn quit_spawned(app: &DesktopApp, pid: u32) -> Result<(), String> {
 }
 
 pub(crate) fn launch(app: &DesktopApp, home: &Path, port: Option<u16>) -> Result<u32, String> {
+    #[cfg(target_os = "macos")]
+    {
+        return crate::platform::locale_launch_desktop(&app.path, &app.executable, home, port);
+    }
     #[cfg(target_os = "windows")]
     {
         return crate::platform::desktop_windows::launch(&windows_app(app), Some(home), port);
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let mut command = std::process::Command::new(&app.executable);
         command

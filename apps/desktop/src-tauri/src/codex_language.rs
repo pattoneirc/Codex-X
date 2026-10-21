@@ -123,6 +123,11 @@ struct Runtime {
     progress: Arc<Mutex<Progress>>,
 }
 impl Runtime {
+    fn is_running(&self) -> bool {
+        self.thread
+            .as_ref()
+            .is_some_and(|thread| !thread.is_finished())
+    }
     fn stop(mut self) {
         self.cancel.store(true, Ordering::Release);
         if let Some(thread) = self.thread.take() {
@@ -332,9 +337,31 @@ fn code(locale: Locale, owner: &str) -> String {
         &json!({"locale":locale.tag(),"owner":owner}).to_string(),
     )
 }
-fn status_code(owner: &str) -> String {
-    format!("(()=>{{const s=window.__CODEXX_LOCALE_RUNTIME_V1__;return s&&s.owner==={} ? s.status() : {{installed:false,ready:false}};}})()",json!(owner))
+fn status_code(locale: Locale) -> String {
+    r#"(()=>{
+      try{const u=new URL(location.href);if(window!==window.top||u.protocol!=='app:'||u.host!=='-'||u.username||u.password||!['/','/index.html'].includes(u.pathname))return {installed:false,ready:false};}catch{return {installed:false,ready:false};}
+      const locale=__CODEXX_LOCALE_PROBE__;
+      const s=window.__CODEXX_LOCALE_RUNTIME_V1__;
+      if(s&&typeof s.status==='function'){
+        const v=s.status();
+        if(v&&v.locale===locale)return v;
+      }
+      const language=String(document.documentElement?.lang||'').replace(/_/g,'-').toLowerCase();
+      const languageMatches=locale==='zh-CN'?['zh-cn','zh-hans','zh-hans-cn'].includes(language):/^en(?:-|$)/.test(language);
+      let gate=false;
+      const registry=window.__STATSIG__;
+      const clients=[registry?.firstInstance,...Object.values(registry?.instances||{}).slice(0,16)];
+      for(const client of clients){
+        try{gate ||= client?.getLayer('72216192',{disableExposureLog:true}).get('enable_i18n',false)===true;}catch{}
+      }
+      const messages=locale==='en-US'||performance.getEntriesByType('resource').some(entry=>{
+        try{const u=new URL(entry.name);return u.protocol==='app:'&&u.host==='-'&&/^\/assets\/zh-CN-[a-zA-Z0-9_-]+\.js$/.test(u.pathname);}catch{return false;}
+      });
+      const ready=gate&&languageMatches&&messages;
+      return {installed:ready,ready,locale,native:ready};
+    })()"#.replace("__CODEXX_LOCALE_PROBE__", &json!(locale.tag()).to_string())
 }
+
 fn progress(target: &Arc<Mutex<Progress>>, phase: &str, message: &str, pages: usize) {
     *target.lock().unwrap_or_else(|p| p.into_inner()) = Progress {
         phase: phase.into(),
@@ -343,7 +370,9 @@ fn progress(target: &Arc<Mutex<Progress>>, phase: &str, message: &str, pages: us
     };
 }
 
-fn supervise(
+/// Apply compatibility once, confirm the current pages, then release every CDP
+/// connection. The page's own installed hook does not depend on this process.
+fn bootstrap_once(
     app: desktop::DesktopApp,
     pid: u32,
     port: u16,
@@ -354,94 +383,127 @@ fn supervise(
 ) {
     let started = Instant::now();
     let source = code(locale, &owner);
-    let check = status_code(&owner);
+    let check = status_code(locale);
     let mut sessions: HashMap<String, cdp::Session> = HashMap::new();
-    let mut ever_ready = false;
-    let mut waiting_since: Option<Instant> = None;
+    let mut ready_since: Option<(Vec<String>, Instant)> = None;
     let mut last_error = "客户端正在启动，等待可验证的本机调试通道。".to_owned();
-    while !cancel.load(Ordering::Acquire) {
-        let attempt = (|| -> std::result::Result<usize, String> {
+    let mut completed_pages = 0;
+    while !cancel.load(Ordering::Acquire) && started.elapsed() < Duration::from_secs(35) {
+        let mut terminal_error = false;
+        let attempt = (|| -> std::result::Result<(Vec<String>, usize), String> {
             desktop::verify_listener(&app, pid, port)?;
             let targets = cdp::targets(port)?;
             if targets.len() > 16 {
+                terminal_error = true;
                 return Err("官方界面窗口超过兼容模式限制，请减少窗口后重新应用。".into());
             }
-            let present: Vec<_> = targets.iter().map(|target| target.id.clone()).collect();
-            sessions.retain(|id, _| present.contains(id));
             if targets.is_empty() {
-                return Err("没有受支持的 app://-/index.html 官方界面，未执行脚本。".into());
+                return Err("等待官方客户端界面就绪。".into());
             }
+            // Keep known targets for this bounded setup. A momentary omission
+            // from /json/list must not make an existing page reload again.
+            let mut present: Vec<_> = targets.iter().map(|target| target.id.clone()).collect();
+            present.sort();
             let mut ready = 0;
             for target in targets {
+                if cancel.load(Ordering::Acquire) || started.elapsed() >= Duration::from_secs(35) {
+                    return Err("本次语言应用已到达等待期限。".into());
+                }
+                let mut initial_status = None;
                 if !sessions.contains_key(&target.id) {
+                    if sessions.len() >= 16 {
+                        terminal_error = true;
+                        return Err(
+                            "客户端页面在应用期间持续变化，已停止自动处理，请稍后重试。".into()
+                        );
+                    }
                     let mut session = cdp::Session::connect(&target, port)?;
-                    session.install(&source)?;
+                    match session.begin_bootstrap(&source, &check, locale.tag().unwrap_or("zh-CN"))
+                    {
+                        Ok(cdp::BootstrapResult::Existing(status)) => initial_status = Some(status),
+                        Ok(cdp::BootstrapResult::ReloadRequested) => {}
+                        Err(error) => {
+                            // The reload command may already have reached the
+                            // client. End this attempt rather than sending it again.
+                            terminal_error = true;
+                            let _ = session.cleanup_lease();
+                            return Err(error);
+                        }
+                    }
                     sessions.insert(target.id.clone(), session);
                 }
                 let session = sessions.get_mut(&target.id).unwrap();
-                match session.evaluate(&check) {
-                    Ok(status) => {
-                        if status.get("ready").and_then(Value::as_bool) == Some(true) {
-                            ready += 1;
-                        } else {
-                            last_error =
-                                "已连接官方界面，但尚未确认翻译开关、目标语言和官方语言包。".into();
-                        }
+                let status = initial_status
+                    .map(Ok)
+                    .unwrap_or_else(|| session.evaluate(&check));
+                match status {
+                    Ok(status) if status.get("ready").and_then(Value::as_bool) == Some(true) => {
+                        ready += 1
                     }
-                    Err(error) => {
-                        // Page.reload creates a new execution context. Keep its
-                        // CDP session and registered script while that context
-                        // starts; reconnecting/reloading here would loop forever.
-                        last_error = error;
-                    }
+                    Ok(_) => last_error = "尚未确认目标语言和官方语言包已生效。".into(),
+                    Err(error) => last_error = error,
                 }
             }
-            Ok(ready)
+            Ok((present, ready))
         })();
         match attempt {
-            Ok(ready) if ready > 0 => {
-                ever_ready = true;
-                waiting_since = None;
-                progress(
-                    &state,
-                    "active",
-                    "当前 Codex 窗口已验证简体中文兼容。",
-                    ready,
-                )
+            Ok((present, ready)) if ready == present.len() && ready > 0 => {
+                if ready_since.as_ref().is_some_and(|(previous, since)| {
+                    previous == &present && since.elapsed() >= Duration::from_secs(1)
+                }) {
+                    completed_pages = ready;
+                    break;
+                }
+                if ready_since
+                    .as_ref()
+                    .is_none_or(|(previous, _)| previous != &present)
+                {
+                    ready_since = Some((present, Instant::now()));
+                }
             }
-            Ok(_) => {
-                waiting_since.get_or_insert_with(Instant::now);
-                progress(
-                    &state,
-                    "starting",
-                    "已连接官方界面，等待翻译开关和目标语言包就绪；尚未报告应用成功。",
-                    0,
-                );
-            }
+            Ok(_) => ready_since = None,
             Err(error) => {
+                ready_since = None;
                 last_error = error;
-                if ever_ready {
-                    progress(&state, "failed", &last_error, 0);
+                if terminal_error {
                     break;
                 }
             }
         }
-        if !ever_ready && started.elapsed() > Duration::from_secs(35) {
-            progress(&state,"failed",&format!("未能验证语言兼容：{last_error} 请使用“恢复并重启”恢复正常启动；此构建可能不支持该模式。"),0);
-            break;
-        }
-        if ever_ready
-            && waiting_since.is_some_and(|start| start.elapsed() > Duration::from_secs(20))
-        {
-            progress(&state,"failed","官方界面长时间未重新验证目标语言，兼容状态已失效；请检查是否在官方设置中改过语言，或恢复后重新应用。",0);
-            break;
-        }
-        for _ in 0..10 {
+        for _ in 0..5 {
             if cancel.load(Ordering::Acquire) {
                 break;
             }
             std::thread::sleep(Duration::from_millis(100));
         }
+    }
+    // Remove only this short-lived setup's future-document registrations.
+    // Never call the page's restore function, reload, or keep watching it.
+    for session in sessions.values_mut() {
+        let _ = session.cleanup_lease();
+    }
+    drop(sessions);
+    if cancel.load(Ordering::Acquire) {
+        progress(
+            &state,
+            "inactive",
+            "本次语言应用已停止，不会继续处理客户端界面。",
+            0,
+        );
+    } else if completed_pages > 0 {
+        progress(
+            &state,
+            "active",
+            "简体中文已应用，兼容连接已结束，可退出 Codex-X。",
+            completed_pages,
+        );
+    } else {
+        progress(
+            &state,
+            "failed",
+            &format!("本次语言应用未完成：{last_error} 已停止自动处理，可手动重启后重试。"),
+            0,
+        );
     }
 }
 
@@ -661,13 +723,13 @@ impl PreparedRuntime {
         let watched = state.clone();
         let (sender, receiver) = std::sync::mpsc::channel::<u32>();
         let thread = std::thread::Builder::new()
-            .name("codex-language-compatibility".into())
+            .name("codex-language-setup".into())
             .spawn(move || {
                 if let Ok(pid) = receiver.recv() {
-                    supervise(app, pid, port, locale, owner, cancelled, watched);
+                    bootstrap_once(app, pid, port, locale, owner, cancelled, watched);
                 }
             })
-            .map_err(|_| CodexxError::Config("无法创建兼容监督线程，客户端尚未退出。".into()))?;
+            .map_err(|_| CodexxError::Config("无法创建语言应用线程，客户端尚未退出。".into()))?;
         Ok(Self {
             reservation: Some(reservation),
             port,
@@ -689,7 +751,7 @@ impl PreparedRuntime {
             .take()
             .unwrap()
             .send(pid)
-            .map_err(|_| CodexxError::Config("兼容监督未接收启动结果，请恢复后重试。".into()))?;
+            .map_err(|_| CodexxError::Config("语言应用任务未接收启动结果，请重试。".into()))?;
         Ok(self.runtime.take().unwrap())
     }
 }
@@ -713,8 +775,9 @@ pub(crate) fn restart_client(config_dir: Option<String>) -> Result<(String, bool
         let active = runtime()
             .lock()
             .map_err(|_| CodexxError::Config("语言兼容状态忙，请重试".into()))?;
-        scope_available(active.as_ref().map(|item| item.scope.as_str()), &scope)?;
-        active.is_some()
+        let running = active.as_ref().filter(|item| item.is_running());
+        scope_available(running.map(|item| item.scope.as_str()), &scope)?;
+        running.is_some()
     };
     let status = get_status(config_dir.clone())?;
     if (status.supported || cfg!(target_os = "windows"))
@@ -742,7 +805,10 @@ fn apply_locked(config_dir: Option<String>, restore: bool) -> Result<LanguageSta
             .lock()
             .map_err(|_| CodexxError::Config("语言兼容状态忙，客户端尚未退出。".into()))?;
         scope_available(
-            current.as_ref().map(|runtime| runtime.scope.as_str()),
+            current
+                .as_ref()
+                .filter(|runtime| runtime.is_running())
+                .map(|runtime| runtime.scope.as_str()),
             &scope,
         )?;
     }

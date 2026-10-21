@@ -81,10 +81,21 @@ pub(super) fn targets(port: u16) -> Result<Vec<Target>, String> {
         .collect())
 }
 
+#[derive(Debug)]
+pub(super) enum BootstrapResult {
+    /// The current document already owns a compatible, self-contained hook.
+    /// Preserve its readiness state and avoid registering or reloading it.
+    Existing(Value),
+    /// A single bootstrap reload was acknowledged. Readiness still needs to
+    /// be verified by polling the caller's probe; this is not application success.
+    ReloadRequested,
+}
+
 pub(super) struct Session {
     socket: WebSocket<TcpStream>,
     next_id: u64,
     script: String,
+    bootstrap_started: bool,
 }
 impl Session {
     pub(super) fn connect(target: &Target, port: u16) -> Result<Self, String> {
@@ -113,6 +124,7 @@ impl Session {
             socket,
             next_id: 0,
             script: String::new(),
+            bootstrap_started: false,
         })
     }
     pub(super) fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
@@ -153,22 +165,68 @@ impl Session {
         }
         Err("等待界面兼容结果超时".into())
     }
-    pub(super) fn install(&mut self, source: &str) -> Result<(), String> {
+    /// Begin once per explicit bootstrap attempt. Every error is terminal for
+    /// that attempt, even if a registration/reload acknowledgement was lost.
+    /// Callers must not reconnect and repeat installation after such an error.
+    pub(super) fn begin_bootstrap(
+        &mut self,
+        source: &str,
+        check: &str,
+        locale: &str,
+    ) -> Result<BootstrapResult, String> {
+        if self.bootstrap_started {
+            return Err("本轮界面引导已经开始，未重复注册脚本或重载页面。".into());
+        }
+        // Consume the attempt before any fallible request: a write or reply
+        // failure cannot prove that the browser did not execute the command.
+        self.bootstrap_started = true;
+        if !matches!(locale, "zh-CN" | "en-US") {
+            return Err("目标界面语言不受支持，未注册脚本或重载页面。".into());
+        }
         let origin=self.evaluate("(()=>{try{const u=new URL(location.href);return {allowed:window===window.top&&u.protocol==='app:'&&u.host==='-'&&!u.username&&!u.password&&['/','/index.html'].includes(u.pathname)};}catch{return {allowed:false};}})()")?;
         if origin.get("allowed").and_then(Value::as_bool) != Some(true) {
             return Err("目标页面来源在连接后已改变，未注册脚本或重载页面。".into());
         }
+        let existing = self.evaluate(check)?;
+        if existing.get("installed").and_then(Value::as_bool) == Some(true)
+            && existing.get("locale").and_then(Value::as_str) == Some(locale)
+        {
+            return Ok(BootstrapResult::Existing(existing));
+        }
         self.call("Page.enable", json!({}))?;
-        let result = self.call(
-            "Page.addScriptToEvaluateOnNewDocument",
-            json!({"source":source}),
-        )?;
+        let result = self
+            .call(
+                "Page.addScriptToEvaluateOnNewDocument",
+                json!({"source":source}),
+            )
+            .map_err(|error| {
+                format!("未能确认兼容脚本注册，已停止本轮引导，不会自动重试或重载：{error}")
+            })?;
         self.script = result
             .get("identifier")
             .and_then(Value::as_str)
-            .ok_or("客户端未确认兼容脚本注册")?
+            .filter(|id| !id.is_empty())
+            .ok_or("客户端未确认兼容脚本注册，已停止本轮引导，未继续重载。")?
             .to_owned();
-        self.call("Page.reload", json!({"ignoreCache":false}))?;
+        self.call("Page.reload", json!({"ignoreCache":false}))
+            .map_err(|error| {
+                format!("页面重载请求可能已经发出，已停止本轮引导，不会再次发送：{error}")
+            })?;
+        Ok(BootstrapResult::ReloadRequested)
+    }
+
+    /// Explicitly release only this session's future-document registration
+    /// after bootstrap verification. Never restore the live hook or reload it.
+    pub(super) fn cleanup_lease(&mut self) -> Result<(), String> {
+        if self.script.is_empty() {
+            return Ok(());
+        }
+        let script = self.script.clone();
+        self.call(
+            "Page.removeScriptToEvaluateOnNewDocument",
+            json!({"identifier":script}),
+        )?;
+        self.script.clear();
         Ok(())
     }
     pub(super) fn evaluate(&mut self, source: &str) -> Result<Value, String> {
@@ -184,13 +242,9 @@ impl Session {
 }
 impl Drop for Session {
     fn drop(&mut self) {
-        if !self.script.is_empty() {
-            let script = self.script.clone();
-            let _ = self.call(
-                "Page.removeScriptToEvaluateOnNewDocument",
-                json!({"identifier":script}),
-            );
-        }
+        // Dropping a connection is not permission to change the page or its
+        // registered scripts. A successful bootstrap releases its own lease
+        // explicitly; disconnecting must never restore or reload the client.
         let _ = self.socket.close(None);
     }
 }
@@ -230,6 +284,7 @@ mod tests {
             let mut socket = tungstenite::accept(stream).unwrap();
             for (index, expected) in [
                 "Runtime.evaluate",
+                "Runtime.evaluate",
                 "Page.enable",
                 "Page.addScriptToEvaluateOnNewDocument",
                 "Page.reload",
@@ -252,7 +307,12 @@ mod tests {
                     "Runtime.evaluate" if index == 0 => {
                         json!({"result":{"value":{"allowed":true}}})
                     }
-                    "Runtime.evaluate" => json!({"result":{"value":{"ready":true}}}),
+                    "Runtime.evaluate" if index == 1 => {
+                        json!({"result":{"value":{"installed":false,"ready":false}}})
+                    }
+                    "Runtime.evaluate" => {
+                        json!({"result":{"value":{"installed":true,"locale":"zh-CN","ready":true}}})
+                    }
                     _ => json!({}),
                 };
                 socket
@@ -272,8 +332,18 @@ mod tests {
         };
         {
             let mut session = Session::connect(&target, port).unwrap();
-            session.install("/* fixture i18n script */").unwrap();
+            assert!(matches!(
+                session
+                    .begin_bootstrap("/* fixture i18n script */", "fixtureStatus()", "zh-CN")
+                    .unwrap(),
+                BootstrapResult::ReloadRequested
+            ));
+            assert!(session
+                .begin_bootstrap("/* fixture i18n script */", "fixtureStatus()", "zh-CN")
+                .is_err());
             assert_eq!(session.evaluate("fixtureStatus()").unwrap()["ready"], true);
+            session.cleanup_lease().unwrap();
+            session.cleanup_lease().unwrap();
         }
         server.join().unwrap();
     }
