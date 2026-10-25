@@ -6,6 +6,8 @@ export { Checkbox } from "./Checkbox";
 export type { CheckboxProps } from "./Checkbox";
 export { Toggle } from "./Toggle";
 export type { ToggleProps } from "./Toggle";
+export { Select, ComboBox } from "./Select";
+export type { SelectProps, ComboBoxProps, SelectOption, FormControlOption } from "./Select";
 export { StatusBadge } from "./StatusBadge";
 export type { StatusBadgeProps, StatusBadgeSize, StatusBadgeTone } from "./StatusBadge";
 export { ModalShell } from "./ModalShell";

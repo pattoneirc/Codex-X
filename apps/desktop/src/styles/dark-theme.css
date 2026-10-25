@@ -466,8 +466,7 @@
   border-color: rgba(56, 189, 248, 0.34);
 }
 
-:root[data-theme="dark"] .cx-providers-field input,
-:root[data-theme="dark"] .cx-providers-field select,
+:root[data-theme="dark"] .cx-providers-field input:not([role="combobox"]),
 :root[data-theme="dark"] .cx-providers-field textarea,
 :root[data-theme="dark"] .cx-providers-secret-input,
 :root[data-theme="dark"] .cx-providers-secret-input input,

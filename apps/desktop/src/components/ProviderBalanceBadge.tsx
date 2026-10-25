@@ -11,9 +11,17 @@ function errorLabel(code: string | null, zh: boolean) {
   return zh ? "暂时无法查询" : "Temporarily unavailable";
 }
 
-function amountText(amount: string) {
+function amountText(amount: string, fixedDecimals = false) {
   const match = /^(-?)(\d+)(?:\.(\d+))?$/.exec(amount);
   if (!match) return amount;
+  if (fixedDecimals) {
+    const fraction = (match[3] || "").padEnd(3, "0");
+    let cents = BigInt(match[2] + fraction.slice(0, 2));
+    if (fraction[2] >= "5") cents += 1n;
+    const digits = cents.toString().padStart(3, "0");
+    const integer = digits.slice(0, -2).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+    return `${match[1] === "-" && cents !== 0n ? "−" : ""}${integer}.${digits.slice(-2)}`;
+  }
   const integer = match[2].replace(/\B(?=(\d{3})+(?!\d))/g, ",");
   const fraction = (match[3] || "").replace(/0+$/, "").padEnd(2, "0");
   // Group the exact decimal string; financial values never pass through Number.
@@ -32,7 +40,8 @@ export function ProviderBalanceBadge({ balance, loading, refreshing = false, fai
   const hasBalance = Boolean(balance?.balances.length);
   const unavailable = failed || Boolean(balance?.errorCode);
   const busy = loading || refreshing;
-  const label = balance?.balanceKind === "credit_limit" ? (zh ? "Key 剩余额度" : "Key credit left") : (zh ? "可用余额" : "Available balance");
+  const label = balance?.balanceKind === "credit_limit" ? (zh ? "Key 剩余额度" : "Key credit left")
+    : balance?.vendor === "sub2api" ? (zh ? "钱包余额" : "Wallet balance") : (zh ? "可用余额" : "Available balance");
   const updated = balance?.checkedAt ? new Date(balance.checkedAt) : null;
   const updateTime = updated && Number.isFinite(updated.getTime())
     ? updated.toLocaleTimeString(zh ? "zh-CN" : "en-GB", { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" }) : null;
@@ -48,7 +57,7 @@ export function ProviderBalanceBadge({ balance, loading, refreshing = false, fai
     <div className="cx-provider-balance-reading">
     {hasBalance ? <div className={`cx-provider-balance-amounts${balance!.balances.length > 1 ? " cx-provider-balance-amounts--multiple" : ""}`}>
       {balance!.balances.map(item => <div key={item.currency} className={`cx-provider-balance-value${item.amount.startsWith("-") || /^0(?:\.0+)?$/.test(item.amount) ? " cx-provider-balance-value--empty" : ""}`} title={`${item.amount} ${item.currency}`}>
-        <strong>{amountText(item.amount)}</strong><span>{item.currency}</span>
+        <strong>{amountText(item.amount, balance!.vendor === "sub2api")}</strong><span>{item.currency}</span>
       </div>)}
     </div> : busy ? <div className="cx-provider-balance-placeholder" aria-label={zh ? "正在查询余额" : "Loading balance"}><span /></div>
       : <div className="cx-provider-balance-unavailable"><AlertCircle size={14} aria-hidden="true" /><span>{detail}</span></div>}

@@ -17,9 +17,15 @@ async function loadPage() {
       const emitted = new Map();
       async function compile(sourcePath) {
         if (emitted.has(sourcePath)) return emitted.get(sourcePath);
-        const outputPath = join(scratch, relative(desktop, sourcePath).replace(/\.tsx?$/, ".mjs"));
+        const outputPath = join(scratch, relative(desktop, sourcePath).replace(/\.(?:tsx?|json)$/, ".mjs"));
         emitted.set(sourcePath, outputPath);
         const source = await readFile(sourcePath, "utf8");
+        if (sourcePath.endsWith(".json")) {
+          JSON.parse(source);
+          await mkdir(dirname(outputPath), { recursive: true });
+          await writeFile(outputPath, `export default JSON.parse(${JSON.stringify(source)});\n`);
+          return outputPath;
+        }
         // Animation is unrelated to action locks and has browser layout effects.
         let output = sourcePath.endsWith("/PageTransition.tsx") ? "export function PageTransition({ children }) { return children; }" : ts.transpileModule(source, {
           fileName: sourcePath,
@@ -29,8 +35,8 @@ async function loadPage() {
           const specifier = match[1];
           const base = resolve(dirname(sourcePath), specifier);
           let dependency;
-          for (const candidate of [`${base}.ts`, `${base}.tsx`, join(base, "index.ts")]) {
-            try { await readFile(candidate, "utf8"); dependency = candidate; break; } catch { /* Try the next TS module candidate. */ }
+          for (const candidate of [base, `${base}.ts`, `${base}.tsx`, join(base, "index.ts")]) {
+            try { await readFile(candidate, "utf8"); dependency = candidate; break; } catch { /* Try an explicit JSON/file import, then TS module candidates. */ }
           }
           assert.ok(dependency, `could not resolve ${specifier}`);
           const dependencyOutput = await compile(dependency);

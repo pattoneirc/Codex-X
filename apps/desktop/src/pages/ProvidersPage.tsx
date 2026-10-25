@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
@@ -32,7 +32,8 @@ import { providerUpstreamApi } from "../providerProtocol";
 import { OfficialAuthImportError, readOfficialAuthImport } from "../officialAuthImport";
 import { ProviderPresetPicker } from "../components/ProviderPresetPicker";
 import { PROVIDER_PRESETS, getProviderPreset, getProviderPresetVariant } from "../providerPresets";
-import { Button, Checkbox, ModalShell } from "../components/ui";
+import { BUNDLED_OFFICIAL_MODELS, officialModelOptions, type OfficialModelCatalog } from "../officialModels";
+import { Button, Checkbox, ComboBox, ModalShell, Select } from "../components/ui";
 import type { ProviderMode, ProviderModelMapping } from "../types";
 import { moveProviderRow, providerRowKey } from "../providerRowOrder";
 import "../styles/providers-page.css";
@@ -171,6 +172,11 @@ export type ProvidersPageProps = {
   providerModelMappings: readonly ProviderModelMapping[];
   onProviderModelMappingsChange: (rows: ProviderModelMapping[]) => void;
   officialForm: OfficialFormValue;
+  officialModels?: OfficialModelCatalog;
+  officialModelsLoading?: boolean;
+  officialDraftSyncing?: boolean;
+  officialDraftSyncError?: string;
+  onRefreshOfficialModels?: () => void;
   officialProfileIsDefault: boolean;
   canLoadCurrentOfficial: boolean;
   officialAuthRef?: Ref<HTMLTextAreaElement>;
@@ -503,10 +509,15 @@ function ListPage({
   };
 
   const confirmDelete = async () => {
-    if (!providerToDelete || deleting) return;
+    if (!providerToDelete || deleting || providerActionsBusy) return;
+    const latest = providerRows.find((row) => row.source === providerToDelete.source && row.id === providerToDelete.id);
+    if (!latest?.deletable) {
+      setProviderToDelete(null);
+      return;
+    }
     setDeleting(true);
     try {
-      if (await onDeleteProvider(providerToDelete)) setProviderToDelete(null);
+      if (await onDeleteProvider(latest)) setProviderToDelete(null);
     } finally {
       setDeleting(false);
     }
@@ -538,15 +549,17 @@ function ListPage({
       </header>
 
       <p className="cx-providers-sort-hint">{lang === "zh" ? "拖动卡片左侧手柄调整顺序，自动保存。" : "Drag the handle on the left to reorder. Changes save automatically."}</p>
-      <div className="cx-providers-list" role="list" ref={listRef}>
+      <div className="cx-providers-list" role="list" aria-label={lang === "zh" ? "供应商列表" : "Providers"} tabIndex={0} ref={listRef}>
         {providerRows.length === 0 ? (
           <div className="cx-providers-empty" role="status">{copy.noProviders}</div>
         ) : providerRows.map((row) => {
           const balance = providerBalances?.balances.find(item => item.source === row.source && item.providerId === row.id);
-          const showBalance = row.source !== "official" && (balance ? balance.supported : supportsProviderBalance(row.baseUrl));
+          const showBalance = row.source !== "official" && (balance?.vendor === "sub2api"
+            ? balance.supported && !balance.errorCode && balance.balances.length > 0
+            : balance ? balance.supported : supportsProviderBalance(row.baseUrl));
           const testingKey = row.testingKey || `${row.source}-${row.id}`;
           const isTesting = testingId === testingKey;
-          const isProtectedOfficial = row.source === "official" && row.isDefaultOfficial === true;
+          const isProtectedOfficial = row.source === "official" && !row.deletable;
           const key = providerRowKey(row);
           const modelName = row.modelDisplayName || row.model || (lang === "zh" ? "跟随 Codex" : "Follow Codex");
           return (
@@ -648,7 +661,7 @@ function ListPage({
                 {(row.deletable || isProtectedOfficial) && (
                   <ActionIconButton
                     icon={Trash2}
-                    label={isProtectedOfficial ? (lang === "zh" ? "默认官方配置不可删除" : "The default official profile cannot be deleted") : copy.removeLabel}
+                    label={isProtectedOfficial ? (lang === "zh" ? "至少保留一个官方账号" : "Keep at least one official account") : copy.removeLabel}
                     onClick={() => { if (!isProtectedOfficial) setProviderToDelete(row); }}
                     disabled={providerActionsBusy || isProtectedOfficial}
                     danger={!isProtectedOfficial}
@@ -728,6 +741,11 @@ function OfficialForm({
   onPresetSelect,
   onPresetVariantSelect,
   officialForm,
+  officialModels = BUNDLED_OFFICIAL_MODELS,
+  officialModelsLoading = false,
+  officialDraftSyncing = false,
+  officialDraftSyncError = "",
+  onRefreshOfficialModels,
   officialProfileIsDefault,
   canLoadCurrentOfficial,
   officialAuthRef,
@@ -744,7 +762,7 @@ function OfficialForm({
   onLoadCcSwitchOfficial,
   onLoadCurrentOfficial,
   onResetOfficial,
-}: Pick<ProvidersPageProps, "lang" | "copy" | "creatingProvider" | "selectedPresetId" | "selectedPresetVariantId" | "onPresetSelect" | "onPresetVariantSelect" | "officialForm" | "officialProfileIsDefault" | "canLoadCurrentOfficial" | "officialAuthRef" | "officialTomlRef" | "officialInfo" | "loading" | "actionBusy" | "onCancelMode" | "onOfficialNameChange" | "onOfficialModelChange" | "onOfficialAuthChange" | "onOfficialConfigChange" | "onSaveOfficial" | "onLoadCcSwitchOfficial" | "onLoadCurrentOfficial" | "onResetOfficial">) {
+}: Pick<ProvidersPageProps, "lang" | "copy" | "creatingProvider" | "selectedPresetId" | "selectedPresetVariantId" | "onPresetSelect" | "onPresetVariantSelect" | "officialForm" | "officialModels" | "officialModelsLoading" | "officialDraftSyncing" | "officialDraftSyncError" | "onRefreshOfficialModels" | "officialProfileIsDefault" | "canLoadCurrentOfficial" | "officialAuthRef" | "officialTomlRef" | "officialInfo" | "loading" | "actionBusy" | "onCancelMode" | "onOfficialNameChange" | "onOfficialModelChange" | "onOfficialAuthChange" | "onOfficialConfigChange" | "onSaveOfficial" | "onLoadCcSwitchOfficial" | "onLoadCurrentOfficial" | "onResetOfficial">) {
   const [resetConfirmOpen, setResetConfirmOpen] = useState(false);
   const [contextWindowBusy, setContextWindowBusy] = useState(false);
   const [authImportBusy, setAuthImportBusy] = useState(false);
@@ -752,6 +770,7 @@ function OfficialForm({
   const [authImportName, setAuthImportName] = useState("");
   const authFileRef = useRef<HTMLInputElement>(null);
   const authImportRequest = useRef(0);
+  const models = officialModelOptions(officialModels.models, officialForm.model);
   useEffect(() => () => { authImportRequest.current += 1; }, []);
   const loadingCcSwitch = actionBusy === "loadCcSwitchOfficial";
   const loadingCurrent = actionBusy === "loadCurrentOfficial";
@@ -762,7 +781,7 @@ function OfficialForm({
     : "Authentication may be left empty. Save and enable this provider, then sign in through Codex. A copied official provider keeps its authentication and can be renamed.";
 
   const confirmReset = () => {
-    if (!showDefaultActions || formBusy) return;
+    if (!showDefaultActions || formBusy || officialDraftSyncing || officialDraftSyncError) return;
     setResetConfirmOpen(false);
     onResetOfficial();
   };
@@ -794,20 +813,44 @@ function OfficialForm({
         onCancel={onCancelMode}
         disabled={formBusy}
       />
-      <ProviderPresetSection lang={lang} creatingProvider={creatingProvider} selectedPresetId={selectedPresetId} selectedPresetVariantId={selectedPresetVariantId} onPresetSelect={onPresetSelect} onPresetVariantSelect={onPresetVariantSelect} disabled={formBusy} />
+      <ProviderPresetSection lang={lang} creatingProvider={creatingProvider} selectedPresetId={selectedPresetId} selectedPresetVariantId={selectedPresetVariantId} onPresetSelect={onPresetSelect} onPresetVariantSelect={onPresetVariantSelect} disabled={formBusy || officialDraftSyncing} />
       <div className="cx-providers-info-grid">
         <div><span>{copy.officialUrlLabel}</span><code>{officialInfo.officialUrl}</code></div>
         <div><span>{copy.authPathLabel}</span><code>{officialInfo.authPath}</code></div>
         <div><span>{copy.officialCurrentLabel}</span><code>{officialInfo.current}</code></div>
       </div>
-      <div className="cx-providers-form-grid cx-providers-form-grid--single">
+      <div className="cx-providers-form-grid cx-providers-form-grid--official">
         <Field label={copy.nameLabel}><input value={officialForm.providerName} onChange={(event) => onOfficialNameChange(event.target.value)} disabled={formBusy} /></Field>
-        <Field label={copy.modelLabel}><input value={officialForm.model} onChange={(event) => onOfficialModelChange(event.target.value)} disabled={formBusy} /></Field>
+        <Field label={copy.modelLabel}>
+          <div className="cx-providers-model-input-row">
+            <ComboBox value={officialForm.model} aria-label={copy.modelLabel}
+              placeholder={lang === "zh" ? "输入或选择模型" : "Enter or choose a model"}
+              options={[
+                { value: "", label: lang === "zh" ? "跟随 Codex" : "Follow Codex" },
+                ...models.map(model => ({ value: model.id, label: model.displayName || model.id,
+                  description: model.displayName && model.displayName !== model.id ? model.id : undefined,
+                  badge: model.isDefault ? (lang === "zh" ? "推荐" : "Recommended") : undefined })),
+              ]}
+              emptyText={lang === "zh" ? "没有匹配项，可直接输入模型 ID" : "No matches. You can enter a model ID."}
+              onValueChange={onOfficialModelChange} disabled={formBusy} />
+            <button type="button" className="cx-providers-button cx-providers-button--secondary cx-providers-button--small cx-providers-fetch-models"
+              disabled={formBusy || officialModelsLoading || !onRefreshOfficialModels} onClick={onRefreshOfficialModels}
+              title={lang === "zh" ? "刷新官方模型目录" : "Refresh official model catalog"} aria-label={lang === "zh" ? "刷新官方模型目录" : "Refresh official model catalog"}>
+              <RefreshCw size={14} className={officialModelsLoading ? "cx-providers-spin" : undefined} aria-hidden="true" />
+              {lang === "zh" ? "刷新" : "Refresh"}
+            </button>
+          </div>
+          <small className="cx-providers-context-hint">{lang === "zh" ? "无需登录；实际可用性以账号为准。" : "No sign-in needed; availability depends on your account."} {officialModels.source === "local"
+            ? (lang === "zh" ? "本机模型目录。" : "Local model catalog.") : (lang === "zh" ? "内置模型目录。" : "Bundled model catalog.")}</small>
+          {officialModels.warning && <small className="cx-providers-context-hint" role="status">{officialModels.warning}</small>}
+          {officialDraftSyncing && <small className="cx-providers-context-hint" role="status">{lang === "zh" ? "正在同步模型与 TOML…" : "Synchronizing the model and TOML…"}</small>}
+          {officialDraftSyncError && <small className="cx-providers-context-error" role="alert">{officialDraftSyncError}</small>}
+        </Field>
       </div>
       <div className="cx-providers-editor-field">
         <div className="cx-providers-context-heading">
           <span>{copy.officialTomlLabel}</span>
-          <ContextWindowControl lang={lang} configText={officialForm.configText} onConfigChange={onOfficialConfigChange} disabled={formBusy} onBusyChange={setContextWindowBusy} />
+          <ContextWindowControl lang={lang} configText={officialForm.configText} onConfigChange={onOfficialConfigChange} disabled={formBusy || officialDraftSyncing} onBusyChange={setContextWindowBusy} />
         </div>
         <textarea
           ref={officialTomlRef}
@@ -821,7 +864,7 @@ function OfficialForm({
       </div>
       <Field label={copy.officialAuthLabel} className="cx-providers-editor-field">
         <div className="cx-providers-context-heading">
-          <button type="button" className="cx-providers-button cx-providers-button--secondary" disabled={formBusy} onClick={() => authFileRef.current?.click()}>
+          <button type="button" className="cx-providers-button cx-providers-button--secondary" disabled={formBusy || officialDraftSyncing} onClick={() => authFileRef.current?.click()}>
             <Download size={14} aria-hidden="true" />{lang === "zh" ? "导入 auth.json 文件" : "Import auth.json file"}
           </button>
           <input ref={authFileRef} type="file" accept=".json,application/json" hidden onChange={event => {
@@ -842,24 +885,24 @@ function OfficialForm({
         />
       </Field>
       <div className="cx-providers-form-actions cx-providers-form-actions--save cx-providers-official-actions">
-        <button type="button" className="cx-providers-button cx-providers-button--secondary" onClick={onLoadCurrentOfficial} disabled={formBusy || !canLoadCurrentOfficial}>
+        <button type="button" className="cx-providers-button cx-providers-button--secondary" onClick={onLoadCurrentOfficial} disabled={formBusy || officialDraftSyncing || !canLoadCurrentOfficial}>
           {loadingCurrent
             ? <Loader2 size={15} className="cx-providers-spin" aria-hidden="true" />
             : <Download size={15} aria-hidden="true" />}
           {lang === "zh" ? "读取当前官方登录" : "Load current official login"}
         </button>
-        <button type="button" className="cx-providers-button cx-providers-button--secondary" onClick={onLoadCcSwitchOfficial} disabled={formBusy}>
+        <button type="button" className="cx-providers-button cx-providers-button--secondary" onClick={onLoadCcSwitchOfficial} disabled={formBusy || officialDraftSyncing}>
           {loadingCcSwitch
             ? <Loader2 size={15} className="cx-providers-spin" aria-hidden="true" />
             : <Download size={15} aria-hidden="true" />}
           {copy.loadCcSwitchOfficialLabel}
         </button>
         {showDefaultActions && (
-          <button type="button" className="cx-providers-button cx-providers-button--secondary" onClick={() => setResetConfirmOpen(true)} disabled={formBusy}>
+          <button type="button" className="cx-providers-button cx-providers-button--secondary" onClick={() => setResetConfirmOpen(true)} disabled={formBusy || officialDraftSyncing || Boolean(officialDraftSyncError)}>
             <FilePlus2 size={15} aria-hidden="true" />{copy.resetOfficialLabel}
           </button>
         )}
-        <button type="button" className="cx-providers-button cx-providers-button--primary" onClick={onSaveOfficial} disabled={formBusy}><CheckCircle2 size={15} aria-hidden="true" />{copy.officialSaveLabel}</button>
+        <button type="button" className="cx-providers-button cx-providers-button--primary" onClick={onSaveOfficial} disabled={formBusy || officialDraftSyncing || Boolean(officialDraftSyncError)}><CheckCircle2 size={15} aria-hidden="true" />{copy.officialSaveLabel}</button>
       </div>
       <ModalShell
         open={resetConfirmOpen && showDefaultActions}
@@ -917,7 +960,6 @@ function ProviderForm({
   onResetProviderToml,
   onSaveProvider,
 }: Pick<ProvidersPageProps, "lang" | "copy" | "creatingProvider" | "selectedPresetId" | "selectedPresetVariantId" | "onPresetSelect" | "onPresetVariantSelect" | "providerForm" | "providerModelMappings" | "onProviderModelMappingsChange" | "loading" | "editingProviderId" | "providerAuthPreview" | "providerTomlDraft" | "providerTomlRef" | "apiKeyVisible" | "availableModels" | "fetchingModels" | "onCancelMode" | "onApiKeyChange" | "onBaseUrlChange" | "onProviderNameChange" | "onProviderModelChange" | "onFetchModels" | "onUpstreamApiChange" | "onRequiresAuthChange" | "onToggleApiKeyVisibility" | "onProviderTomlDraftChange" | "onProviderHeadersConfigChange" | "onResetProviderToml" | "onSaveProvider">) {
-  const modelListId = useId();
   const [contextWindowBusy, setContextWindowBusy] = useState(false);
   const [headersBusy, setHeadersBusy] = useState(false);
   const [headersValid, setHeadersValid] = useState(true);
@@ -961,11 +1003,13 @@ function ProviderForm({
           <Field label={copy.nameLabel}><input value={providerForm.providerName} onChange={(event) => onProviderNameChange(event.target.value)} disabled={formBusy} /></Field>
           <Field label={copy.modelLabel}>
             <div className="cx-providers-model-input-row">
-              <input
+              <ComboBox
                 value={providerForm.model}
-                list={availableModels.length ? modelListId : undefined}
+                options={availableModels.map(model => ({ value: model, label: model }))}
                 aria-label={copy.modelLabel}
-                onChange={(event) => onProviderModelChange(event.target.value)}
+                placeholder={lang === "zh" ? "输入或选择模型" : "Enter or choose a model"}
+                emptyText={lang === "zh" ? (availableModels.length ? "没有匹配项，可直接输入模型 ID" : "可手动输入，或刷新获取模型列表") : "Enter a model ID or refresh the model list."}
+                onValueChange={onProviderModelChange}
                 disabled={formBusy}
               />
               <button
@@ -979,37 +1023,21 @@ function ProviderForm({
                 {fetchingModels
                   ? <Loader2 size={14} className="cx-providers-spin" aria-hidden="true" />
                   : <RefreshCw size={14} aria-hidden="true" />}
-                {fetchingModels ? copy.fetchingModelsLabel : copy.fetchModelsLabel}
+                {lang === "zh" ? "刷新" : "Refresh"}
               </button>
             </div>
-            {availableModels.length > 0 && (
-              <>
-                <datalist id={modelListId}>
-                  {availableModels.map((model) => <option value={model} key={model} />)}
-                </datalist>
-                <select
-                  className="cx-providers-model-select"
-                  value=""
-                  aria-label={copy.chooseModelLabel(availableModels.length)}
-                  disabled={formBusy}
-                  onChange={(event) => {
-                    if (event.target.value) onProviderModelChange(event.target.value);
-                  }}
-                >
-                  <option value="">{copy.chooseModelLabel(availableModels.length)}</option>
-                  {availableModels.map((model) => <option value={model} key={model}>{model}</option>)}
-                </select>
-              </>
-            )}
           </Field>
-          <Field label={lang === "zh" ? "上游接口协议" : "Upstream API protocol"}>
-            <select value={providerUpstreamApi(providerForm)} onChange={(event) => onUpstreamApiChange(event.target.value)} disabled={formBusy}>
-              <option value="responses">OpenAI Responses</option>
-              <option value="chat_completions">OpenAI Chat Completions</option>
-              <option value="anthropic_messages">Claude Messages</option>
-              <option value="gemini">Gemini generateContent</option>
-              {!["responses", "chat_completions", "anthropic_messages", "gemini"].includes(providerUpstreamApi(providerForm)) && <option value={providerUpstreamApi(providerForm)} disabled>{lang === "zh" ? "不支持的协议，请重新选择" : "Unsupported protocol — choose a supported API"}</option>}
-            </select>
+          <Field label={lang === "zh" ? "上游接口协议" : "Upstream API protocol"} className="cx-providers-protocol-field">
+            <Select value={providerUpstreamApi(providerForm)} onValueChange={onUpstreamApiChange} disabled={formBusy}
+              aria-label={lang === "zh" ? "上游接口协议" : "Upstream API protocol"}
+              options={[
+                { value: "responses", label: "OpenAI Responses" },
+                { value: "chat_completions", label: "OpenAI Chat Completions" },
+                { value: "anthropic_messages", label: "Claude Messages" },
+                { value: "gemini", label: "Gemini generateContent" },
+                ...(!["responses", "chat_completions", "anthropic_messages", "gemini"].includes(providerUpstreamApi(providerForm))
+                  ? [{ value: providerUpstreamApi(providerForm), label: lang === "zh" ? "不支持的协议，请重新选择" : "Unsupported protocol — choose again", disabled: true }] : []),
+              ]} />
           </Field>
           {providerUpstreamApi(providerForm) !== "responses" && (
             <p className="cx-providers-field--full cx-providers-protocol-hint">

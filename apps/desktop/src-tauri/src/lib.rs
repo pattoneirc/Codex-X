@@ -28,6 +28,8 @@ mod error;
 mod failover;
 mod file_io;
 mod live_config;
+mod official_model_draft;
+mod official_models;
 mod paths;
 mod platform;
 mod prompts;
@@ -177,6 +179,7 @@ struct AboutInfo {
 struct CodexDesktopRestartResult {
     app_name: String,
     was_running: bool,
+    warning: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -726,7 +729,7 @@ async fn get_about_info(config_dir: Option<String>) -> Result<AboutInfo> {
 async fn restart_codex_desktop(
     config_dir: Option<String>,
 ) -> std::result::Result<CodexDesktopRestartResult, String> {
-    let (app_name, was_running) = tauri::async_runtime::spawn_blocking(move || {
+    let (app_name, was_running, warning) = tauri::async_runtime::spawn_blocking(move || {
         let codex_dir = resolve_codex_dir(config_dir.clone()).map_err(|e| e.to_string())?;
         sessions::with_session_maintenance(&codex_dir, || {
             codex_language::restart_client(config_dir)
@@ -738,6 +741,7 @@ async fn restart_codex_desktop(
     Ok(CodexDesktopRestartResult {
         app_name,
         was_running,
+        warning,
     })
 }
 
@@ -1284,6 +1288,31 @@ async fn repair_provider_model_catalog(
 }
 
 #[tauri::command]
+async fn list_official_models(
+    force_refresh: Option<bool>,
+) -> Result<official_models::OfficialModelsResult> {
+    tauri::async_runtime::spawn_blocking(move || {
+        official_models::list_official_models(force_refresh.unwrap_or(false))
+    })
+    .await
+    .map_err(|_| CodexxError::Config("读取官方模型目录失败，请稍后刷新。".into()))
+}
+
+#[tauri::command]
+async fn update_official_model_draft(config_text: String, model: String) -> Result<String> {
+    tauri::async_runtime::spawn_blocking(move || official_model_draft::update(&config_text, &model))
+        .await
+        .map_err(|_| CodexxError::Config("更新模型草稿失败，未修改配置。".into()))?
+}
+
+#[tauri::command]
+async fn inspect_official_model_draft(config_text: String) -> Result<Option<String>> {
+    tauri::async_runtime::spawn_blocking(move || official_model_draft::inspect(&config_text))
+        .await
+        .map_err(|_| CodexxError::Config("读取模型草稿失败。".into()))?
+}
+
+#[tauri::command]
 async fn get_codex_state(config_dir: Option<String>) -> Result<CodexState> {
     tauri::async_runtime::spawn_blocking(move || get_codex_state_inner(config_dir))
         .await
@@ -1299,10 +1328,9 @@ fn get_codex_state_inner(config_dir: Option<String>) -> Result<CodexState> {
 async fn switch_official_provider(config_dir: Option<String>) -> Result<ActionResult> {
     tauri::async_runtime::spawn_blocking(move || {
         failover::with_provider_change(config_dir.clone(), || {
-            let result = switch_official_profile_inner(
-                config_dir,
-                providers::official_profiles::DEFAULT_OFFICIAL_PROFILE_ID.to_string(),
-            )?;
+            let codex_dir = resolve_codex_dir(config_dir.clone())?;
+            let profile_id = providers::official_profiles::default_profile_id(&codex_dir)?;
+            let result = switch_official_profile_inner(config_dir, profile_id)?;
             Ok(finish_provider_selection(
                 result,
                 ActiveProviderSelectionUpdate::ClearIfOfficial,
@@ -1987,6 +2015,9 @@ pub fn run() {
             delete_saved_provider,
             get_codex_state,
             repair_provider_model_catalog,
+            list_official_models,
+            update_official_model_draft,
+            inspect_official_model_draft,
             switch_official_provider,
             list_official_profiles,
             get_official_profile,

@@ -9,6 +9,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 
 const desktop = dirname(dirname(fileURLToPath(import.meta.url)));
 let components;
+let selectCapture;
 async function ui() {
   if (components) return components;
   components = (async () => {
@@ -17,18 +18,34 @@ async function ui() {
       const emitted = new Map();
       async function compile(sourcePath) {
         if (emitted.has(sourcePath)) return emitted.get(sourcePath);
-        const outputPath = join(scratch, relative(desktop, sourcePath).replace(/\.tsx?$/, ".mjs"));
+        const outputPath = join(scratch, relative(desktop, sourcePath).replace(/\.(?:tsx?|json)$/, ".mjs"));
         emitted.set(sourcePath, outputPath);
-        let output = ts.transpileModule(await readFile(sourcePath, "utf8"), {
+        const source = await readFile(sourcePath, "utf8");
+        if (sourcePath.endsWith(".json")) {
+          JSON.parse(source);
+          await mkdir(dirname(outputPath), { recursive: true });
+          await writeFile(outputPath, `export default JSON.parse(${JSON.stringify(source)});\n`);
+          return outputPath;
+        }
+        let output = ts.transpileModule(source, {
           fileName: sourcePath,
           compilerOptions: { target: ts.ScriptTarget.ES2020, module: ts.ModuleKind.ESNext, jsx: ts.JsxEmit.ReactJSX },
         }).outputText.replace(/import\s*["'][^"']+\.css["'];?/g, "");
+        if (sourcePath === join(desktop, "src/components/ui/Select.tsx")) {
+          // Record the real Select contract while still rendering its actual
+          // closed combobox. Portal options intentionally do not exist in SSR.
+          assert.match(output, /export function Select\(/);
+          output = output.replace(/export function Select\(/, "function ActualSelect(");
+          output = `import { createElement as captureElement } from "react";\n${output}\n`
+            + `const capturedSelects = [];\nexport function Select(props) { capturedSelects.push(props); return captureElement(ActualSelect, props); }\n`
+            + `export function readSelectProps() { return [...capturedSelects]; }\nexport function resetSelectProps() { capturedSelects.length = 0; }\n`;
+        }
         for (const match of [...output.matchAll(/\bfrom\s*["'](\.[^"']+)["']/g)]) {
           const specifier = match[1];
           const base = resolve(dirname(sourcePath), specifier);
           let dependency;
-          for (const candidate of [`${base}.ts`, `${base}.tsx`, join(base, "index.ts")]) {
-            try { await readFile(candidate, "utf8"); dependency = candidate; break; } catch { /* Normal TypeScript resolution candidates. */ }
+          for (const candidate of [base, `${base}.ts`, `${base}.tsx`, join(base, "index.ts")]) {
+            try { await readFile(candidate, "utf8"); dependency = candidate; break; } catch { /* Explicit JSON/file import, then normal TypeScript candidates. */ }
           }
           assert.ok(dependency, `could not resolve ${specifier} from ${sourcePath}`);
           const dependencyOutput = await compile(dependency);
@@ -42,6 +59,7 @@ async function ui() {
       }
       const editor = await compile(join(desktop, "src/components/ProviderHeadersEditor.tsx"));
       const page = await compile(join(desktop, "src/pages/ProvidersPage.tsx"));
+      selectCapture = await import(pathToFileURL(emitted.get(join(desktop, "src/components/ui/Select.tsx"))).href);
       return { ...await import(pathToFileURL(editor).href), ...await import(pathToFileURL(page).href) };
     } finally { await rm(scratch, { recursive: true, force: true }); }
   })();
@@ -54,6 +72,7 @@ function render(Component, props) {
   const warnings = [];
   const originalError = console.error;
   try {
+    selectCapture.resetSelectProps();
     console.error = (...args) => warnings.push(args.join(" "));
     const html = renderToStaticMarkup(createElement(Component, props));
     for (const warning of warnings) assert.match(warning, /^Warning: useLayoutEffect does nothing on the server/);
@@ -73,15 +92,23 @@ function control(html, name, label) {
   assert.ok(found, `${name} with accessible label ${label}`);
   return found;
 }
+function selectControl(html, label) {
+  const found = control(html, "button", label);
+  assert.equal(found.attrs.role, "combobox", "the real custom Select must expose combobox semantics");
+  assert.equal(found.attrs["aria-haspopup"], "listbox");
+  assert.equal(found.attrs["aria-expanded"], "false", "SSR does not open a portal menu");
+  const props = selectCapture.readSelectProps().find(props => props["aria-label"] === label);
+  assert.ok(props, `actual Select props for ${label}`);
+  return { ...found, props };
+}
 function selectedOption(select) {
-  const selected = elements(select.tag, "option").filter(({ attrs }) => "selected" in attrs);
+  const selected = select.props.options.filter(option => option.value === select.props.value);
   assert.equal(selected.length, 1, "a protocol/source selector must have one explicit selected option");
+  assert.ok(select.tag.includes(selected[0].label), "the closed real combobox must display the selected option label");
   return selected[0];
 }
-function protocolSelect(html) {
-  const found = elements(html, "select").find(({ tag }) => elements(tag, "option").some(({ attrs }) => attrs.value === "responses"));
-  assert.ok(found, "the actual provider form must include its upstream protocol selector");
-  return found;
+function protocolSelect(html, lang) {
+  return selectControl(html, lang === "zh" ? "上游接口协议" : "Upstream API protocol");
 }
 const noop = () => {};
 const validRows = [
@@ -140,8 +167,8 @@ for (const lang of ["zh", "en"]) {
     assert.ok(html.includes(`role="group" aria-label="${rowLabel(1)}"`));
     assert.equal(control(html, "input", `${nameLabel} · ${rowLabel(0)}`).attrs.value, "X-Title");
     assert.equal(control(html, "input", `${valueLabel} · ${rowLabel(0)}`).attrs.value, "Fixture Project");
-    assert.equal(selectedOption(control(html, "select", `${sourceLabel} · ${rowLabel(0)}`)).attrs.value, "static");
-    assert.equal(selectedOption(control(html, "select", `${sourceLabel} · ${rowLabel(1)}`)).attrs.value, "env");
+    assert.equal(selectedOption(selectControl(html, `${sourceLabel} · ${rowLabel(0)}`)).value, "static");
+    assert.equal(selectedOption(selectControl(html, `${sourceLabel} · ${rowLabel(1)}`)).value, "env");
     const env = control(html, "input", `${envLabel} · ${rowLabel(1)}`);
     assert.equal(env.attrs.value, "FIXTURE_PROJECT_NAME");
     assert.equal(env.attrs["aria-invalid"], "false");
@@ -168,13 +195,14 @@ for (const lang of ["zh", "en"]) {
       ["input", `${nameLabel} · ${rowLabel(0)}`, zh ? "名称只能使用" : "Use letters, numbers"],
       ["input", `${envLabel} · ${rowLabel(1)}`, zh ? "请填写环境变量名" : "Enter an environment variable name"],
       ["input", `${valueLabel} · ${rowLabel(2)}`, zh ? "不能包含换行或控制字符" : "cannot contain line breaks or control characters"],
-      ["select", `${sourceLabel} · ${rowLabel(3)}`, zh ? "请选择固定值或环境变量" : "Choose a literal value or environment variable"],
+      ["button", `${sourceLabel} · ${rowLabel(3)}`, zh ? "请选择固定值或环境变量" : "Choose a literal value or environment variable"],
       ["input", `${nameLabel} · ${rowLabel(4)}`, zh ? "此名称重复" : "Duplicate header name"],
       ["input", `${nameLabel} · ${rowLabel(5)}`, zh ? "此名称重复" : "Duplicate header name"],
     ];
     const errorIds = new Set();
     for (const [element, label, message] of cases) {
       const field = control(html, element, label);
+      if (element === "button") selectControl(html, label);
       assert.equal(field.attrs["aria-invalid"], "true", label);
       const errorId = field.attrs["aria-describedby"];
       assert.ok(errorId, `error description for ${label}`);
@@ -190,10 +218,13 @@ for (const lang of ["zh", "en"]) {
   test(`Headers editor offers explicit UA presets and header-specific examples (${lang})`, async () => {
     const { ProviderHeadersEditor } = await ui();
     const empty = render(ProviderHeadersEditor, { lang, rows: [], onChange: noop });
-    const preset = control(empty, "select", zh ? "User-Agent 预设" : "User-Agent presets");
-    assert.deepEqual(elements(preset.tag, "option").map(({ attrs }) => attrs.value), ["", "claude_code", "kilo_code"]);
-    assert.ok(preset.tag.includes("claude-cli/2.1.161 (external, cli)"));
-    assert.ok(preset.tag.includes("Kilo-Code/1.0"));
+    const preset = selectControl(empty, zh ? "User-Agent 预设" : "User-Agent presets");
+    assert.equal(preset.props.value, "", "the preset is an explicit action, not an automatically selected header");
+    assert.equal(preset.props.placeholder, zh ? "User-Agent 预设" : "User-Agent presets");
+    assert.ok(preset.tag.includes(preset.props.placeholder));
+    assert.deepEqual(preset.props.options.map(option => option.value), ["claude_code", "kilo_code"]);
+    assert.ok(preset.props.options.some(option => option.description === "claude-cli/2.1.161 (external, cli)"));
+    assert.ok(preset.props.options.some(option => option.description === "Kilo-Code/1.0"));
     assert.equal(elements(empty, "input").length, 0, "mounting must not create headers from presets");
     assert.ok(empty.includes(zh ? "其他请求头保留" : "keep other headers"));
     const names = ["User-Agent", "HTTP-Referer", "X-Title", "Authorization"];
@@ -222,10 +253,19 @@ for (const lang of ["zh", "en"]) {
     assert.ok(html.includes(zh ? "正在读取 Headers…" : "Reading headers…"));
     assert.ok(html.includes(zh ? "尚未配置自定义 Headers" : "No custom headers configured"), "SSR shows initial control state and does not run the TOML-read effect");
     assert.equal(configChanges, 0);
-    const select = protocolSelect(html);
-    assert.deepEqual(elements(select.tag, "option").map(({ attrs }) => attrs.value), ["responses", "chat_completions", "anthropic_messages", "gemini"]);
-    for (const label of ["OpenAI Responses", "OpenAI Chat Completions", "Claude Messages", "Gemini generateContent"]) assert.ok(select.tag.includes(label));
-    assert.equal(selectedOption(select).attrs.value, "responses");
+    const select = protocolSelect(html, lang);
+    const choices = [
+      ["responses", "OpenAI Responses"], ["chat_completions", "OpenAI Chat Completions"],
+      ["anthropic_messages", "Claude Messages"], ["gemini", "Gemini generateContent"],
+    ];
+    assert.deepEqual(select.props.options.map(option => [option.value, option.label]), choices);
+    assert.ok(select.props.options.every(option => !option.disabled));
+    assert.equal(selectedOption(select).value, "responses");
+    for (const [protocol, label] of choices) {
+      const selected = selectedOption(protocolSelect(render(ProvidersPage, formProps(lang, protocol)), lang));
+      assert.equal(selected.value, protocol);
+      assert.equal(selected.label, label);
+    }
     assert.ok(html.includes(zh ? "上游接口协议" : "Upstream API protocol"));
   });
 
@@ -233,7 +273,7 @@ for (const lang of ["zh", "en"]) {
     const { ProvidersPage } = await ui();
     for (const protocol of ["chat_completions", "anthropic_messages", "gemini"]) {
       const html = render(ProvidersPage, formProps(lang, protocol));
-      assert.equal(selectedOption(protocolSelect(html)).attrs.value, protocol);
+      assert.equal(selectedOption(protocolSelect(html, lang)).value, protocol);
       const hint = elements(html, "p").find(({ attrs }) => attrs.class?.includes("cx-providers-protocol-hint"));
       assert.ok(hint, `routing explanation for ${protocol}`);
       for (const text of zh ? ["Codex 仍使用 Responses", "开启本地路由和配置接管", "保持 Codex-X 运行", "退出期间请求会暂停", "重开后自动恢复", "切回 Responses"] : ["Codex still uses Responses", "local router and config takeover", "keep Codex-X running", "before disabling the router", "resume after reopening"]) assert.ok(hint.tag.includes(text), text);
@@ -244,7 +284,7 @@ for (const lang of ["zh", "en"]) {
     const { ProvidersPage } = await ui();
     for (const upstreamApi of [undefined, "responses"]) {
       const html = render(ProvidersPage, formProps(lang, upstreamApi, { providerForm: { ...formProps(lang).providerForm, upstreamApi } }));
-      assert.equal(selectedOption(protocolSelect(html)).attrs.value, "responses");
+      assert.equal(selectedOption(protocolSelect(html, lang)).value, "responses");
       assert.ok(!html.includes("cx-providers-protocol-hint"));
     }
     for (const providerForm of [
@@ -252,14 +292,16 @@ for (const lang of ["zh", "en"]) {
       { ...formProps(lang).providerForm, upstreamApi: null, wireApi: "fixture_legacy_api" },
     ]) {
       const html = render(ProvidersPage, formProps(lang, "responses", { providerForm }));
-      const chosen = selectedOption(protocolSelect(html));
-      assert.equal(chosen.attrs.value, providerForm.upstreamApi || providerForm.wireApi);
-      assert.ok("disabled" in chosen.attrs);
-      assert.ok(chosen.tag.includes(zh ? "不支持的协议，请重新选择" : "Unsupported protocol"));
-      assert.notEqual(chosen.attrs.value, "responses");
+      const select = protocolSelect(html, lang);
+      const chosen = selectedOption(select);
+      assert.equal(chosen.value, providerForm.upstreamApi || providerForm.wireApi);
+      assert.equal(chosen.disabled, true, "an unknown API must stay an explicitly unsupported choice");
+      assert.ok(chosen.label.includes(zh ? "不支持的协议，请重新选择" : "Unsupported protocol"));
+      assert.notEqual(chosen.value, "responses");
+      assert.equal(select.attrs.disabled, undefined, "users must be able to choose a supported replacement");
     }
     const legacyChat = render(ProvidersPage, formProps(lang, "responses", { providerForm: { ...formProps(lang).providerForm, upstreamApi: null, wireApi: "chat" } }));
-    assert.equal(selectedOption(protocolSelect(legacyChat)).attrs.value, "chat_completions");
+    assert.equal(selectedOption(protocolSelect(legacyChat, lang)).value, "chat_completions");
     assert.ok(legacyChat.includes("cx-providers-protocol-hint"));
   });
 }

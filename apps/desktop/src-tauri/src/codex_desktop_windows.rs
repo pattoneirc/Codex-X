@@ -52,6 +52,9 @@ fn powershell(script: &str, data: Value, timeout: Duration) -> Result<Value, Str
         timeout,
     )?;
     if !output.status.success() {
+        if String::from_utf8_lossy(&output.stderr).contains("CODEXX_STORE_ELEVATION_REQUIRED") {
+            return Err("Codex-X 正以管理员身份运行，无法启动 Microsoft Store 版 Codex。请退出 Codex-X，取消“以管理员身份运行”后重新打开。本次尚未关闭 Codex。".into());
+        }
         let details = String::from_utf8_lossy(&output.stderr)
             .chars()
             .take(1800)
@@ -142,7 +145,7 @@ function ValidateApp($app) {
   }
   $principal=[Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
   if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    throw 'Microsoft Store activation requires Codex-X to run without administrator elevation. No client was stopped.'
+    throw 'CODEXX_STORE_ELEVATION_REQUIRED'
   }
   $family=([string]$app.bundleId).Split('!')[0]
   $package=@(Get-AppxPackage | Where-Object { [string]$_.PackageFamilyName -ceq $family }) | Select-Object -First 1
@@ -478,11 +481,12 @@ Emit $true
     .map(|_| ())
 }
 
-pub(crate) fn restart() -> Result<(String, bool), String> {
+pub(crate) fn restart(home: &Path) -> Result<(String, bool), String> {
     let app = detect_fresh()?;
     validate(&app)?;
+    validate_launch(&app, home)?;
     let was_running = !pids(&app)?.is_empty();
     quit(&app)?;
-    launch(&app, None, None)?;
+    launch(&app, Some(home), None)?;
     Ok((app.name, was_running))
 }

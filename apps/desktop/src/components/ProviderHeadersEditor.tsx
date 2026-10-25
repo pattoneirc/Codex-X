@@ -1,5 +1,6 @@
 import { useId } from "react";
 import { Plus, Trash2 } from "lucide-react";
+import { Select } from "./ui";
 import {
   createProviderHeader,
   removeProviderHeader,
@@ -41,14 +42,12 @@ export function ProviderHeadersEditor({ lang, rows, disabled = false, onChange }
     <div className="cx-provider-headers-heading">
       <div><strong id={`${id}-title`}>{copy.title}<span>{copy.optional}</span></strong><p>{copy.hint}</p></div>
       <div className="cx-provider-headers-actions">
-        <select className="cx-provider-headers-presets" aria-label={copy.presets} aria-describedby={`${id}-preset-hint`} value="" disabled={disabled} onChange={(event) => {
-          const selected = event.currentTarget.value;
-          if (selected) onChange(applyProviderHeaderPreset(rows, selected));
-        }}>
-          <option value="">{copy.presets}</option>
-          {PROVIDER_HEADER_PRESETS.map((preset) => <option key={preset.id} value={preset.id}>{preset.label[lang]} · {preset.value}</option>)}
-        </select>
-        <button type="button" className="cx-providers-button cx-providers-button--secondary cx-providers-button--small" disabled={disabled} onClick={() => onChange([...rows, createProviderHeader()])}><Plus size={14} aria-hidden="true" />{copy.add}</button>
+        <Select className="cx-provider-headers-presets" size="md" aria-label={copy.presets} aria-describedby={`${id}-preset-hint`} value="" placeholder={copy.presets} disabled={disabled}
+          options={PROVIDER_HEADER_PRESETS.map((preset) => ({ value: preset.id, label: preset.label[lang], description: preset.value }))}
+          onValueChange={(selected) => {
+            if (!disabled && selected) onChange(applyProviderHeaderPreset(rows, selected));
+          }} />
+        <button type="button" className="cx-providers-button cx-providers-button--secondary cx-provider-headers-add" disabled={disabled} onClick={() => onChange([...rows, createProviderHeader()])}><Plus size={14} aria-hidden="true" />{copy.add}</button>
       </div>
     </div>
     <p className="cx-provider-headers-hint cx-provider-headers-preset-hint" id={`${id}-preset-hint`}>{copy.presetHint}</p>
@@ -56,9 +55,23 @@ export function ProviderHeadersEditor({ lang, rows, disabled = false, onChange }
       {rows.map((row, index) => {
         const error = validation.errors[index];
         return <div key={index} className="cx-provider-header-row" role="group" aria-label={copy.row(index)}>
-          <label className="cx-provider-header-field"><span>{copy.name}</span><input value={row.name} placeholder={copy.placeholder} aria-label={`${copy.name} · ${copy.row(index)}`} aria-invalid={Boolean(error.name)} aria-describedby={error.name ? `${id}-${index}-name-error` : undefined} onChange={(event) => update(index, { name: event.currentTarget.value })} disabled={disabled} autoComplete="off" autoCapitalize="none" spellCheck={false} />{error.name && <small id={`${id}-${index}-name-error`}>{error.name}</small>}</label>
-          <label className="cx-provider-header-field"><span>{copy.source}</span><select value={row.source} aria-label={`${copy.source} · ${copy.row(index)}`} aria-invalid={Boolean(error.source)} aria-describedby={error.source ? `${id}-${index}-source-error` : undefined} onChange={(event) => update(index, { source: event.currentTarget.value as ProviderHeaderSource })} disabled={disabled}><option value="static">{copy.literal}</option><option value="env">{copy.env}</option></select>{error.source && <small id={`${id}-${index}-source-error`}>{error.source}</small>}</label>
-          <label className="cx-provider-header-field"><span>{row.source === "env" ? copy.env : copy.value}</span><input value={row.value} placeholder={row.source === "env" ? copy.envPlaceholder : providerHeaderValuePlaceholder(row.name, lang)} aria-label={`${row.source === "env" ? copy.env : copy.value} · ${copy.row(index)}`} aria-invalid={Boolean(error.value)} aria-describedby={error.value ? `${id}-${index}-value-error` : row.source === "env" ? `${id}-env-hint` : undefined} onChange={(event) => update(index, { value: event.currentTarget.value })} disabled={disabled} autoComplete="off" autoCapitalize="none" spellCheck={false} />{error.value && <small id={`${id}-${index}-value-error`}>{error.value}</small>}</label>
+          <div className="cx-provider-header-field cx-provider-header-field--name">
+            <label htmlFor={`${id}-${index}-name`}>{copy.name}</label>
+            <input id={`${id}-${index}-name`} value={row.name} placeholder={copy.placeholder} aria-label={`${copy.name} · ${copy.row(index)}`} aria-invalid={Boolean(error.name)} aria-describedby={error.name ? `${id}-${index}-name-error` : undefined} onChange={(event) => update(index, { name: event.currentTarget.value })} disabled={disabled} autoComplete="off" autoCapitalize="none" spellCheck={false} />
+            {error.name && <small id={`${id}-${index}-name-error`}>{error.name}</small>}
+          </div>
+          <div className="cx-provider-header-field cx-provider-header-field--source">
+            <label htmlFor={`${id}-${index}-source`}>{copy.source}</label>
+            <Select id={`${id}-${index}-source`} className="cx-provider-header-source" size="md" value={row.source} aria-label={`${copy.source} · ${copy.row(index)}`} aria-invalid={Boolean(error.source)} aria-describedby={error.source ? `${id}-${index}-source-error` : undefined} disabled={disabled}
+              options={[{ value: "static", label: copy.literal }, { value: "env", label: copy.env }]}
+              onValueChange={(source) => update(index, { source: source as ProviderHeaderSource })} />
+            {error.source && <small id={`${id}-${index}-source-error`}>{error.source}</small>}
+          </div>
+          <div className="cx-provider-header-field cx-provider-header-field--value">
+            <label htmlFor={`${id}-${index}-value`}>{row.source === "env" ? copy.env : copy.value}</label>
+            <input id={`${id}-${index}-value`} value={row.value} placeholder={row.source === "env" ? copy.envPlaceholder : providerHeaderValuePlaceholder(row.name, lang)} aria-label={`${row.source === "env" ? copy.env : copy.value} · ${copy.row(index)}`} aria-invalid={Boolean(error.value)} aria-describedby={error.value ? `${id}-${index}-value-error` : row.source === "env" ? `${id}-env-hint` : undefined} onChange={(event) => update(index, { value: event.currentTarget.value })} disabled={disabled} autoComplete="off" autoCapitalize="none" spellCheck={false} />
+            {error.value && <small id={`${id}-${index}-value-error`}>{error.value}</small>}
+          </div>
           <button type="button" className="cx-providers-icon-button cx-providers-icon-button--danger cx-provider-header-remove" title={`${copy.remove} · ${copy.row(index)}`} aria-label={`${copy.remove} · ${copy.row(index)}`} disabled={disabled} onClick={() => onChange(removeProviderHeader(rows, index))}><Trash2 size={14} aria-hidden="true" /></button>
         </div>;
       })}

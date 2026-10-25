@@ -4,7 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 export type ProviderBalance = {
   source: "local" | "detected";
   providerId: string;
-  vendor: "deepseek" | "openrouter" | "siliconflow" | "moonshot" | null;
+  vendor: "deepseek" | "openrouter" | "siliconflow" | "moonshot" | "sub2api" | null;
   supported: boolean;
   balanceKind: "balance" | "credit_limit" | null;
   balances: { currency: string; amount: string }[];
@@ -20,11 +20,26 @@ export type ProviderBalanceState = {
 };
 
 function keepLastBalance(previous: ProviderBalance | undefined, next: ProviderBalance): ProviderBalance {
+  // Sub2API is discovered by a successful wallet response. Failed probes must
+  // disappear instead of inheriting an old wallet value or an error placeholder.
+  if (next.vendor === "sub2api" || previous?.vendor === "sub2api") {
+    if (!next.supported || next.errorCode || next.balances.length === 0) {
+      return { ...next, supported: false, balances: [], balanceKind: null };
+    }
+    if (previous?.supported && !previous.errorCode && previous.checkedAt && next.checkedAt && previous.checkedAt > next.checkedAt) return previous;
+    return next;
+  }
   if (next.errorCode && previous?.balances.length) {
     return { ...next, balances: previous.balances, balanceKind: previous.balanceKind, checkedAt: previous.checkedAt };
   }
   if (!next.errorCode && previous?.checkedAt && next.checkedAt && previous.checkedAt > next.checkedAt) return previous;
   return next;
+}
+
+function failedBalance(balance: ProviderBalance): ProviderBalance {
+  return balance.vendor === "sub2api"
+    ? { ...balance, supported: false, balances: [], balanceKind: null, errorCode: "refresh_failed" }
+    : { ...balance, errorCode: "refresh_failed" };
 }
 const REFRESH_INTERVAL = 5 * 60 * 1000;
 
@@ -54,7 +69,7 @@ export function useProviderBalances(configDir: string, revision: string, ready: 
       });
     } catch {
       if (scopeRef.current === scope) setSnapshot(previous => ({ ...previous, balances: previous.balances.some(item => item.source === source && item.providerId === providerId)
-        ? previous.balances.map(item => item.source === source && item.providerId === providerId ? { ...item, errorCode: "refresh_failed" } : item)
+        ? previous.balances.map(item => item.source === source && item.providerId === providerId ? failedBalance(item) : item)
         : [...previous.balances, { source, providerId, supported: true, vendor: null, balanceKind: null, balances: [], checkedAt: null, errorCode: "refresh_failed" }] }));
     } finally {
       manualVersions.current.set(token, (manualVersions.current.get(token) ?? 0) + 1);
@@ -99,7 +114,7 @@ export function useProviderBalances(configDir: string, revision: string, ready: 
         }), failed: false, loading: false }));
       } catch {
         nextDelay = 60_000;
-        if (!disposed) setSnapshot(previous => ({ ...previous, loading: false, failed: previous.balances.length === 0, balances: previous.balances.map(item => item.supported && !shouldPreserveManual(item) ? { ...item, errorCode: "refresh_failed" } : item) }));
+        if (!disposed) setSnapshot(previous => ({ ...previous, loading: false, failed: previous.balances.length === 0, balances: previous.balances.map(item => item.supported && !shouldPreserveManual(item) ? failedBalance(item) : item) }));
       } finally {
         inFlight = false;
         lastAttempt = Date.now();

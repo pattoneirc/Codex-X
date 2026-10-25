@@ -13,7 +13,7 @@ import {
 import { PROMPT_CATEGORY_NAME_MAX_LENGTH } from "../promptCategories";
 import type { PromptCategory } from "../promptCategories";
 import type { Lang } from "../types";
-import { Button, IconButton, ModalShell, cx } from "./ui";
+import { Button, IconButton, ModalShell, Select, cx } from "./ui";
 
 export type PromptCategoryItem = {
   key: string;
@@ -71,6 +71,10 @@ export function PromptCategoryManager({
     for (const prompt of prompts) grouped.get(categoryForPrompt(prompt.key))?.push(prompt);
     return grouped;
   }, [categories, categoryForPrompt, prompts]);
+  const categoryOptions = useMemo(
+    () => categories.map((category) => ({ value: category.id, label: category.name })),
+    [categories],
+  );
 
   const copy = isChinese
     ? {
@@ -262,13 +266,14 @@ export function PromptCategoryManager({
                         <div className="cx-prompt-category-prompt" key={prompt.key}>
                           <FileText size={14} aria-hidden="true" />
                           <span title={prompt.title}>{prompt.title}</span>
-                          <select
+                          <Select
+                            className="cx-prompt-category-move"
+                            size="sm"
                             value={category.id}
-                            onChange={(event) => onMovePrompt(prompt.key, event.currentTarget.value)}
+                            onValueChange={(categoryId) => onMovePrompt(prompt.key, categoryId)}
+                            options={categoryOptions}
                             aria-label={copy.move(prompt.title)}
-                          >
-                            {categories.map((option) => <option key={option.id} value={option.id}>{option.name}</option>)}
-                          </select>
+                          />
                         </div>
                       )) : <p className="cx-prompt-category-empty">{copy.empty}</p>}
                     </div>

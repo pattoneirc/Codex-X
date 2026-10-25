@@ -17,6 +17,16 @@
   --ui-warning: #fbbf24;
   --ui-info: #60a5fa;
   --ui-radius: 8px;
+  --ui-control-height: 40px;
+  --ui-control-height-sm: 32px;
+  --ui-control-radius: 8px;
+  --ui-control-bg: var(--cx-dark-surface-recessed, #292c32);
+  --ui-control-popup-bg: var(--cx-dark-surface, #30333a);
+  --ui-control-border: #4b5059;
+  --ui-control-text: #e8eaf0;
+  --ui-control-muted: #a3a9b5;
+  --ui-control-accent: var(--cx-dark-blue, #76a8ff);
+  --ui-control-focus-ring: rgba(118, 168, 255, 0.18);
 }
 
 :root[data-theme="light"],
@@ -38,6 +48,144 @@
   --ui-success: #059669;
   --ui-warning: #b45309;
   --ui-info: #2563eb;
+  --ui-control-bg: #fff;
+  --ui-control-popup-bg: #fff;
+  --ui-control-border: #dce1e8;
+  --ui-control-text: #20242a;
+  --ui-control-muted: #747b85;
+  --ui-control-accent: #2563eb;
+  --ui-control-focus-ring: rgba(37, 99, 235, 0.13);
+}
+
+/* Custom controls own their border/padding, including inside legacy page fields. */
+.ui-select {
+  --ui-select-height: var(--ui-control-height);
+  position: relative;
+  display: block;
+  width: 100%;
+  min-width: 0;
+  color: var(--ui-control-text);
+  font-size: 13px;
+  line-height: 1.4;
+  -webkit-tap-highlight-color: transparent;
+}
+.ui-select--sm { --ui-select-height: var(--ui-control-height-sm); font-size: 12px; }
+.ui-select .ui-select__trigger,
+.ui-select .ui-select__input {
+  box-sizing: border-box;
+  appearance: none;
+  -webkit-appearance: none;
+  width: 100%;
+  min-width: 0;
+  height: var(--ui-select-height);
+  min-height: var(--ui-select-height);
+  margin: 0;
+  padding: 0 11px;
+  border: 1px solid var(--ui-control-border);
+  border-radius: var(--ui-control-radius);
+  outline: none;
+  background: var(--ui-control-bg);
+  color: var(--ui-control-text);
+  box-shadow: none;
+  font: inherit;
+  letter-spacing: inherit;
+  text-align: left;
+  transition: border-color 140ms ease, box-shadow 140ms ease, background-color 140ms ease;
+}
+.ui-select .ui-select__trigger { display: flex; align-items: center; justify-content: space-between; gap: 9px; cursor: pointer; }
+.ui-select .ui-select__input { display: block; padding-right: 36px; cursor: text; }
+.ui-select__anchor { position: relative; min-width: 0; }
+.ui-select__value { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ui-select__placeholder,
+.ui-select .ui-select__input::placeholder { color: var(--ui-control-muted); opacity: 1; }
+.ui-select__chevron { flex: 0 0 16px; color: var(--ui-control-muted); pointer-events: none; transition: transform 140ms ease; }
+.ui-select__anchor > .ui-select__chevron { position: absolute; top: 50%; right: 11px; display: grid; place-items: center; transform: translateY(-50%); }
+.ui-select--open > .ui-select__trigger > .ui-select__chevron { transform: rotate(180deg); }
+.ui-select--open .ui-select__anchor > .ui-select__chevron { transform: translateY(-50%) rotate(180deg); }
+.ui-select:not(.ui-select--disabled) .ui-select__trigger:hover,
+.ui-select:not(.ui-select--disabled) .ui-select__input:hover { border-color: color-mix(in srgb, var(--ui-control-accent) 50%, var(--ui-control-border)); }
+.ui-select .ui-select__trigger:focus-visible,
+.ui-select .ui-select__input:focus,
+.ui-select--open .ui-select__trigger {
+  border-color: var(--ui-control-accent);
+  outline: none;
+  box-shadow: 0 0 0 3px var(--ui-control-focus-ring);
+}
+.ui-select .ui-select__trigger[aria-invalid="true"],
+.ui-select .ui-select__input[aria-invalid="true"] { border-color: var(--ui-danger); }
+.ui-select .ui-select__trigger[aria-invalid="true"]:focus-visible,
+.ui-select .ui-select__input[aria-invalid="true"]:focus { box-shadow: 0 0 0 3px color-mix(in srgb, var(--ui-danger) 16%, transparent); }
+.ui-select--disabled { opacity: .55; cursor: not-allowed; }
+.ui-select.ui-select--disabled .ui-select__trigger,
+.ui-select.ui-select--disabled .ui-select__input { cursor: not-allowed; opacity: 1; }
+
+/* This listbox lives directly under body, above dialogs and outside scroll clips. */
+.ui-select-popup {
+  position: fixed;
+  z-index: 1400;
+  box-sizing: border-box;
+  min-width: 0;
+  margin: 0;
+  padding: 5px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  border: 1px solid var(--ui-control-border);
+  border-radius: var(--ui-control-radius);
+  background: var(--ui-control-popup-bg);
+  color: var(--ui-control-text);
+  box-shadow: 0 12px 34px rgba(0, 0, 0, .24), 0 2px 7px rgba(0, 0, 0, .12);
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 13px;
+  line-height: 1.4;
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--ui-control-muted) 35%, transparent) transparent;
+}
+.ui-select-popup[data-theme="light"] {
+  --ui-control-popup-bg: #fff;
+  --ui-control-border: #dce1e8;
+  --ui-control-text: #20242a;
+  --ui-control-muted: #747b85;
+  --ui-control-accent: #2563eb;
+  box-shadow: 0 12px 34px rgba(24, 35, 52, .13), 0 2px 7px rgba(24, 35, 52, .07);
+}
+.ui-select-popup[data-theme="dark"] {
+  --ui-control-popup-bg: var(--cx-dark-surface, #30333a);
+  --ui-control-border: #4b5059;
+  --ui-control-text: #e8eaf0;
+  --ui-control-muted: #a3a9b5;
+  --ui-control-accent: var(--cx-dark-blue, #76a8ff);
+}
+.ui-select-popup--sm { font-size: 12px; }
+.ui-select-popup::-webkit-scrollbar { width: 7px; }
+.ui-select-popup::-webkit-scrollbar-thumb { border: 2px solid var(--ui-control-popup-bg); border-radius: 5px; background: color-mix(in srgb, var(--ui-control-muted) 36%, transparent); }
+.ui-select-option {
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  min-height: 38px;
+  padding: 8px 9px;
+  border-radius: 5px;
+  cursor: pointer;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.ui-select-popup--sm .ui-select-option { min-height: 30px; padding-block: 6px; }
+.ui-select-option--selected { color: var(--ui-control-accent); }
+.ui-select-option--active:not(.ui-select-option--disabled),
+.ui-select-option:not(.ui-select-option--disabled):hover { background: color-mix(in srgb, var(--ui-control-accent) 12%, var(--ui-control-popup-bg)); }
+.ui-select-option--disabled { opacity: .42; cursor: not-allowed; }
+.ui-select-option__copy { display: grid; gap: 3px; flex: 1 1 auto; min-width: 0; }
+.ui-select-option__heading { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.ui-select-option__label { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ui-select-option__badge { flex: 0 1 auto; max-width: 100px; padding: 1px 5px; overflow: hidden; border-radius: 4px; color: var(--ui-control-muted); background: color-mix(in srgb, var(--ui-control-muted) 12%, var(--ui-control-popup-bg)); font-size: 10px; line-height: 1.5; text-overflow: ellipsis; white-space: nowrap; }
+.ui-select-option__description { color: var(--ui-control-muted); font-size: 11px; line-height: 1.5; white-space: normal; overflow-wrap: anywhere; }
+.ui-select-option__check { display: grid; place-items: center; width: 16px; flex: 0 0 16px; }
+.ui-select-popup__empty { padding: 13px 10px; color: var(--ui-control-muted); font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+@media (prefers-reduced-motion: reduce) {
+  .ui-select .ui-select__trigger, .ui-select .ui-select__input, .ui-select__chevron { transition: none; }
 }
 
 .ui-button,

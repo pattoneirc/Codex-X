@@ -170,6 +170,7 @@ export type AboutInfo = {
 export type CodexDesktopRestartResult = {
   appName: string;
   wasRunning: boolean;
+  warning?: string | null;
 };
 
 export type ReleaseInfo = {

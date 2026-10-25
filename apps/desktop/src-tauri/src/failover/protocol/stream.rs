@@ -754,6 +754,9 @@ impl<R: Read> ResponseStream<R> {
     pub(crate) fn failure_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.failed)
     }
+    pub(crate) fn upstream_mut(&mut self) -> &mut R {
+        &mut self.upstream
+    }
     fn failure(&mut self, error: String) -> io::Result<()> {
         if self.state.completed {
             self.eof = true;

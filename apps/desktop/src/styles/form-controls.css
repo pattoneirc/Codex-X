@@ -1,0 +1,52 @@
+/* Shared sizing for full-size form fields. Compact list controls use the
+   smaller primitive explicitly; code editors keep their natural height. */
+:root[data-theme] .cx-providers-field input:not([role="combobox"]):not(:disabled),
+:root[data-theme] .cx-provider-header-field > input:not(:disabled),
+:root[data-theme] .cx-provider-mapping-field > input:not(:disabled),
+:root[data-theme] .cx-overview-home-control input:not(:disabled),
+:root[data-theme] .cx-startup-path-control input:not(:disabled),
+:root[data-theme] .cx-prompts-field input:not(:disabled),
+:root[data-theme] .cx-failover input:not(:disabled) {
+  color: var(--ui-control-text, var(--ui-text));
+  background: var(--ui-control-bg, var(--ui-surface));
+}
+
+.cx-provider-header-field > label { font-size: 12px; line-height: 18px; }
+
+.cx-overview-home-control input,
+.cx-startup-path-control input,
+.cx-prompts-field input,
+.cx-failover input {
+  height: var(--ui-control-height, 40px);
+  min-height: var(--ui-control-height, 40px);
+  border-radius: var(--ui-control-radius, 8px);
+  padding-block: 0;
+  transition: border-color 140ms ease, box-shadow 140ms ease, background-color 140ms ease;
+}
+
+.cx-overview-home-control button,
+.cx-startup-path-control .ui-button {
+  min-height: var(--ui-control-height, 40px);
+  border-radius: var(--ui-control-radius, 8px);
+}
+
+.cx-overview-home-control input:focus,
+.cx-startup-path-control input:focus,
+.cx-prompts-field input:focus,
+.cx-failover input:not([aria-invalid="true"]):focus {
+  outline: none;
+  border-color: var(--ui-control-accent, #2563eb);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ui-control-accent, #2563eb) 15%, transparent);
+}
+
+.cx-failover-field-input > span {
+  top: 50%;
+  transform: translateY(-50%);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cx-overview-home-control input,
+  .cx-startup-path-control input,
+  .cx-prompts-field input,
+  .cx-failover input { transition: none; }
+}

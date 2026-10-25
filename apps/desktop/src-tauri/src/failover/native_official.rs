@@ -189,6 +189,7 @@ pub(crate) fn route_for_current(dir: &Path) -> Result<Option<ProxyRoute>> {
         api_key: None,
         headers: Vec::new(),
         models,
+        default_model: crate::string_value(&doc, "model").unwrap_or_default(),
         official: Some(OfficialRouteSpec {
             codex_dir: dir.to_path_buf(),
             profile_id,
@@ -538,6 +539,7 @@ mod tests {
                 local_token.into(),
                 vec![route],
                 ProxyOptions {
+                    source_model: None,
                     auto_failover_enabled: true,
                     tuning: RoutingTuning::default(),
                 },

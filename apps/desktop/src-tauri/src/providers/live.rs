@@ -648,10 +648,8 @@ fn provider_config_base_document(codex_dir: &Path) -> Result<DocumentMut> {
     let current = parse_toml_document(&cfg, &text)?;
     let mut current = crate::failover::direct_document(codex_dir, &current)?;
     if is_provider_only_document(&current) && !common_config_handled(codex_dir)? {
-        let snapshot = saved_official_profile_candidate(
-            codex_dir,
-            super::official_profiles::DEFAULT_OFFICIAL_PROFILE_ID,
-        )?;
+        let default_profile = super::official_profiles::default_profile_id(codex_dir)?;
+        let snapshot = saved_official_profile_candidate(codex_dir, &default_profile)?;
         if let Some(text) = snapshot.and_then(|snapshot| snapshot.config_text) {
             let official = parse_toml_document(&cfg, &text)?;
             // Only recover shared integration tables from the trusted same-home

@@ -237,6 +237,7 @@ struct ProfileRecord {
 struct StoreSnapshot {
     profiles: Vec<ProfileRecord>,
     selection: Option<(String, String)>,
+    default_profile: Option<(String, String)>,
 }
 
 fn database_error(error: rusqlite::Error) -> CodexxError {
@@ -244,6 +245,18 @@ fn database_error(error: rusqlite::Error) -> CodexxError {
 }
 
 fn read_store(conn: &Connection, codex_dir: &Path) -> Result<StoreSnapshot> {
+    if conn.is_autocommit() {
+        // Profile rows, the default pointer and selection form one logical
+        // snapshot. A concurrent deletion must not mix before/after queries.
+        let transaction = conn.unchecked_transaction().map_err(database_error)?;
+        let store = read_store_snapshot(&transaction, codex_dir)?;
+        transaction.commit().map_err(database_error)?;
+        return Ok(store);
+    }
+    read_store_snapshot(conn, codex_dir)
+}
+
+fn read_store_snapshot(conn: &Connection, codex_dir: &Path) -> Result<StoreSnapshot> {
     let scope = normalized_path_scope(codex_dir);
     let mut statement = conn
         .prepare(
@@ -271,31 +284,100 @@ fn read_store(conn: &Connection, codex_dir: &Path) -> Result<StoreSnapshot> {
         )
         .optional()
         .map_err(database_error)?;
+    let default_profile = conn
+        .query_row(
+            "SELECT profile_id, updated_at FROM official_profile_defaults WHERE codex_dir = ?1",
+            [&scope],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(database_error)?;
     Ok(StoreSnapshot {
         profiles,
         selection,
+        default_profile,
     })
 }
 
-pub(crate) fn selected_profile_id(codex_dir: &Path) -> Result<String> {
-    let store = read_store(&open_store()?, codex_dir)?;
+fn store_has_profile(store: &StoreSnapshot, id: &str) -> bool {
+    store.profiles.iter().any(|profile| profile.id == id)
+        || (store.default_profile.is_none() && id == DEFAULT_OFFICIAL_PROFILE_ID)
+}
+
+fn store_default_profile_id(store: &StoreSnapshot) -> Result<&str> {
+    match &store.default_profile {
+        None => Ok(DEFAULT_OFFICIAL_PROFILE_ID),
+        Some((id, _)) if store.profiles.iter().any(|profile| &profile.id == id) => Ok(id),
+        Some(_) => Err(CodexxError::Config(
+            "默认官方配置记录指向的账号已不存在，请检查官方账号配置；未恢复旧账号。".into(),
+        )),
+    }
+}
+
+fn store_selected_profile_id(store: &StoreSnapshot) -> Result<String> {
+    let default_id = store_default_profile_id(store)?;
     Ok(store
         .selection
         .as_ref()
         .map(|(id, _)| id)
-        .filter(|id| {
-            id.as_str() == DEFAULT_OFFICIAL_PROFILE_ID
-                || store.profiles.iter().any(|profile| &profile.id == *id)
-        })
+        .filter(|id| store_has_profile(store, id))
         .cloned()
-        .unwrap_or_else(|| DEFAULT_OFFICIAL_PROFILE_ID.to_string()))
+        .unwrap_or_else(|| default_id.to_string()))
+}
+
+fn store_profile_ids(store: &StoreSnapshot) -> Result<Vec<&str>> {
+    let default_id = store_default_profile_id(store)?;
+    let mut ids = vec![default_id];
+    ids.extend(
+        store
+            .profiles
+            .iter()
+            .map(|profile| profile.id.as_str())
+            .filter(|id| *id != default_id),
+    );
+    Ok(ids)
+}
+
+fn deletion_successor(store: &StoreSnapshot, deleted_id: &str) -> Result<String> {
+    let ids = store_profile_ids(store)?;
+    if !ids.contains(&deleted_id) {
+        return Err(CodexxError::Config(format!("未找到官方配置: {deleted_id}")));
+    }
+    if ids.len() <= 1 {
+        return Err(CodexxError::Config(
+            "至少需要保留一个 OpenAI 官方登录配置。".into(),
+        ));
+    }
+    let selected = store_selected_profile_id(store)?;
+    if selected != deleted_id {
+        return Ok(selected);
+    }
+    ids.into_iter()
+        .find(|id| *id != deleted_id)
+        .map(ToString::to_string)
+        .ok_or_else(|| CodexxError::Config("没有可保留的官方登录配置，未删除账号。".into()))
+}
+
+/// Without a per-home pointer the legacy implicit account remains compatible.
+/// Once a default has been deleted, only explicit surviving profile IDs count.
+pub(crate) fn default_profile_id(codex_dir: &Path) -> Result<String> {
+    let store = read_store(&open_store()?, codex_dir)?;
+    store_default_profile_id(&store).map(ToString::to_string)
+}
+
+pub(crate) fn selected_profile_id(codex_dir: &Path) -> Result<String> {
+    store_selected_profile_id(&read_store(&open_store()?, codex_dir)?)
 }
 
 pub(crate) fn has_named_profiles(codex_dir: &Path) -> Result<bool> {
-    Ok(read_store(&open_store()?, codex_dir)?
-        .profiles
-        .iter()
-        .any(|profile| profile.id != DEFAULT_OFFICIAL_PROFILE_ID))
+    let store = read_store(&open_store()?, codex_dir)?;
+    // A persisted pointer also records that the legacy implicit account was
+    // replaced. Never resume unowned historical-auth recovery afterwards.
+    Ok(store.default_profile.is_some()
+        || store
+            .profiles
+            .iter()
+            .any(|profile| profile.id != DEFAULT_OFFICIAL_PROFILE_ID))
 }
 
 pub(crate) fn active_profile_id(codex_dir: &Path, is_official: bool) -> Result<Option<String>> {
@@ -311,7 +393,7 @@ fn profile_name(codex_dir: &Path, id: &str) -> Result<String> {
     if let Some(profile) = store.profiles.iter().find(|profile| profile.id == id) {
         return Ok(profile.provider_name.clone());
     }
-    if id == DEFAULT_OFFICIAL_PROFILE_ID {
+    if store.default_profile.is_none() && id == DEFAULT_OFFICIAL_PROFILE_ID {
         return Ok(DEFAULT_OFFICIAL_PROFILE_NAME.to_string());
     }
     Err(CodexxError::Config(format!("未找到官方配置: {id}")))
@@ -396,7 +478,7 @@ fn detail(codex_dir: &Path, id: &str) -> Result<OfficialProfileDetail> {
             email: metadata.email,
             plan_type: metadata.plan_type,
             can_query_quota: owned_auth.as_ref().and_then(quota_access_token).is_some(),
-            is_default: id == DEFAULT_OFFICIAL_PROFILE_ID,
+            is_default: id == default_profile_id(codex_dir)?,
             is_current: live_config_is_official(codex_dir)?
                 && selected_profile_id(codex_dir)? == id,
         },
@@ -420,21 +502,22 @@ pub(crate) fn list_official_profiles_inner(
 ) -> Result<Vec<OfficialProfileSummary>> {
     let codex_dir = resolve_codex_dir(config_dir)?;
     let store = read_store(&open_store()?, &codex_dir)?;
+    let default_id = store_default_profile_id(&store)?.to_string();
+    let selected = store_selected_profile_id(&store)?;
     let default_name = store
         .profiles
         .iter()
-        .find(|profile| profile.id == DEFAULT_OFFICIAL_PROFILE_ID)
+        .find(|profile| profile.id == default_id)
         .map(|profile| profile.provider_name.clone())
         .unwrap_or_else(|| DEFAULT_OFFICIAL_PROFILE_NAME.to_string());
-    let mut profiles = vec![(DEFAULT_OFFICIAL_PROFILE_ID.to_string(), default_name)];
+    let mut profiles = vec![(default_id.clone(), default_name)];
     profiles.extend(
         store
             .profiles
             .into_iter()
-            .filter(|profile| profile.id != DEFAULT_OFFICIAL_PROFILE_ID)
+            .filter(|profile| profile.id != default_id)
             .map(|profile| (profile.id, profile.provider_name)),
     );
-    let selected = selected_profile_id(&codex_dir)?;
     let config_path = crate::config_path(&codex_dir);
     let config = parse_toml_document(&config_path, &read_to_string_if_exists(&config_path)?)?;
     let config = crate::failover::direct_document(&codex_dir, &config)?;
@@ -475,7 +558,7 @@ pub(crate) fn list_official_profiles_inner(
                 email: metadata.email,
                 plan_type: metadata.plan_type,
                 can_query_quota: owned_auth.and_then(quota_access_token).is_some(),
-                is_default: id == DEFAULT_OFFICIAL_PROFILE_ID,
+                is_default: id == default_id,
                 id,
                 provider_name,
                 is_current,
@@ -609,11 +692,20 @@ impl Mutation {
                         [&scope],
                     )
                     .map_err(database_error)?;
+                transaction
+                    .execute(
+                        "DELETE FROM official_profile_defaults WHERE codex_dir = ?1",
+                        [&scope],
+                    )
+                    .map_err(database_error)?;
                 for profile in &self.store_before.profiles {
                     transaction.execute("INSERT INTO official_profiles (codex_dir,id,provider_name,created_at,updated_at) VALUES (?1,?2,?3,?4,?5)", params![scope,profile.id,profile.provider_name,profile.created_at,profile.updated_at]).map_err(database_error)?;
                 }
                 if let Some((id, updated)) = &self.store_before.selection {
                     transaction.execute("INSERT INTO official_profile_selections (codex_dir,profile_id,updated_at) VALUES (?1,?2,?3)", params![scope,id,updated]).map_err(database_error)?;
+                }
+                if let Some((id, updated)) = &self.store_before.default_profile {
+                    transaction.execute("INSERT INTO official_profile_defaults (codex_dir,profile_id,updated_at) VALUES (?1,?2,?3)", params![scope,id,updated]).map_err(database_error)?;
                 }
                 transaction.commit().map_err(database_error)
             })();
@@ -656,6 +748,15 @@ fn store_profile(conn: &Connection, codex_dir: &Path, id: &str, name: &str) -> R
 fn select_profile(conn: &Connection, codex_dir: &Path, id: &str) -> Result<()> {
     conn.execute(
         "INSERT INTO official_profile_selections (codex_dir,profile_id,updated_at) VALUES (?1,?2,?3)
+         ON CONFLICT(codex_dir) DO UPDATE SET profile_id=excluded.profile_id,updated_at=excluded.updated_at",
+        params![normalized_path_scope(codex_dir),id,now_rfc3339()],
+    ).map_err(database_error)?;
+    Ok(())
+}
+
+fn set_default_profile(conn: &Connection, codex_dir: &Path, id: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO official_profile_defaults (codex_dir,profile_id,updated_at) VALUES (?1,?2,?3)
          ON CONFLICT(codex_dir) DO UPDATE SET profile_id=excluded.profile_id,updated_at=excluded.updated_at",
         params![normalized_path_scope(codex_dir),id,now_rfc3339()],
     ).map_err(database_error)?;
@@ -790,7 +891,7 @@ pub(crate) fn duplicate_official_profile_inner(
     let base_name =
         provider_name.unwrap_or_else(|| format!("{} 副本", source.profile.provider_name));
     let saved = read_store(&open_store()?, &codex_dir)?;
-    let default_name = profile_name(&codex_dir, DEFAULT_OFFICIAL_PROFILE_ID)?;
+    let default_name = profile_name(&codex_dir, &default_profile_id(&codex_dir)?)?;
     let mut copy_name = bounded_copy_name(&base_name, None);
     let mut suffix = 2;
     while saved
@@ -829,12 +930,13 @@ pub(crate) fn reset_default_official_profile_inner(
             build_official_config_text(&codex_dir, input.model.as_deref(), input.model.is_none())?
         }
     };
+    let default_id = default_profile_id(&codex_dir)?;
     let mut result = save_locked(
         &codex_dir,
         OfficialProfileInput {
             config_dir: None,
-            id: Some(DEFAULT_OFFICIAL_PROFILE_ID.to_string()),
-            provider_name: profile_name(&codex_dir, DEFAULT_OFFICIAL_PROFILE_ID)?,
+            provider_name: profile_name(&codex_dir, &default_id)?,
+            id: Some(default_id),
             model: input.model,
             config_text: Some(config),
             auth_json: Some(String::new()),
@@ -915,29 +1017,49 @@ pub(crate) fn delete_official_profile_inner(
     let codex_dir = resolve_codex_dir(config_dir)?;
     ensure_directory(&codex_dir)?;
     let _lock = acquire_live_config_lock(&codex_dir)?;
-    if profile_id == DEFAULT_OFFICIAL_PROFILE_ID {
-        return Err(CodexxError::Config("不能删除默认官方配置".to_string()));
-    }
-    profile_name(&codex_dir, &profile_id)?;
-    if live_config_is_official(&codex_dir)? && selected_profile_id(&codex_dir)? == profile_id {
+    let before_store = read_store(&open_store()?, &codex_dir)?;
+    deletion_successor(&before_store, &profile_id)?;
+    if live_config_is_official(&codex_dir)?
+        && store_selected_profile_id(&before_store)? == profile_id
+    {
         return Err(CodexxError::Config(
             "请先切换到其他配置，再删除当前官方配置".to_string(),
         ));
     }
     with_mutation(&codex_dir, |mutation| {
+        let expected_store = mutation.store_before.clone();
+        if expected_store != before_store {
+            return Err(CodexxError::Config(
+                "官方配置记录已改变，请刷新后重试。".into(),
+            ));
+        }
         let path = official_snapshot_path_for_profile(&codex_dir, &profile_id)?;
         let before = read_file_snapshot(&path)?;
         mutation.snapshot(&profile_id, || {
             remove_file_if_unchanged(&path, before.as_deref())
         })?;
         mutation.update_store(|conn| {
+            // Read and decide from this same transaction. A new connection
+            // cannot observe this transaction's deletion/selection changes.
+            let store = read_store(conn, &codex_dir)?;
+            if store != expected_store {
+                return Err(CodexxError::Config(
+                    "官方配置记录已改变，请刷新后重试。".into(),
+                ));
+            }
+            let successor = deletion_successor(&store, &profile_id)?;
+            let deletes_default = store_default_profile_id(&store)? == profile_id;
+            let deletes_selected = store_selected_profile_id(&store)? == profile_id;
             conn.execute(
                 "DELETE FROM official_profiles WHERE codex_dir=?1 AND id=?2",
                 params![normalized_path_scope(&codex_dir), profile_id],
             )
             .map_err(database_error)?;
-            if selected_profile_id(&codex_dir)? == profile_id {
-                select_profile(conn, &codex_dir, DEFAULT_OFFICIAL_PROFILE_ID)?;
+            if deletes_default {
+                set_default_profile(conn, &codex_dir, &successor)?;
+            }
+            if deletes_selected {
+                select_profile(conn, &codex_dir, &successor)?;
             }
             Ok(())
         })
@@ -1607,11 +1729,6 @@ mod tests {
             "blank login must never inherit default OAuth"
         );
         assert!(delete_official_profile_inner(scope(&dir), blank.profile.id.clone()).is_err());
-        assert!(delete_official_profile_inner(
-            scope(&dir),
-            DEFAULT_OFFICIAL_PROFILE_ID.to_string()
-        )
-        .is_err());
         write_json(&auth_path(&dir), &auth("new-login")).unwrap();
         switch(&dir, DEFAULT_OFFICIAL_PROFILE_ID);
         assert_eq!(live_auth(&dir), auth("a"));
@@ -1622,6 +1739,11 @@ mod tests {
         delete_official_profile_inner(scope(&dir), blank.profile.id).unwrap();
         assert!(!path.exists());
         assert_eq!(list_official_profiles_inner(scope(&dir)).unwrap().len(), 1);
+        assert!(delete_official_profile_inner(
+            scope(&dir),
+            DEFAULT_OFFICIAL_PROFILE_ID.to_string()
+        )
+        .is_err());
         fs::remove_dir_all(dir).unwrap();
     }
 

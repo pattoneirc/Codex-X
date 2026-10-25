@@ -39,7 +39,7 @@ fn streamed(api: UpstreamApi, input: &str, context: ToolContext) -> String {
 
 #[test]
 fn request_conversions_preserve_roles_media_tools_and_parallel_results() {
-    let body = json!({"model":"fixture","instructions":"system instruction","max_output_tokens":7000,"input":[
+    let body = json!({"model":"fixture","instructions":"system instruction","max_output_tokens":7000,"client_metadata":{"session_id":"fixture-session","client_version":"fixture"},"input":[
         {"role":"developer","content":"developer instruction"},
         {"role":"user","content":[{"type":"input_text","text":"inspect this"},{"type":"input_image","image_url":"data:image/png;base64,aGVsbG8="}]},
         {"type":"function_call","call_id":"call-1","namespace":"functions","name":"read","arguments":"{\"path\":\"x\"}"},
@@ -47,7 +47,15 @@ fn request_conversions_preserve_roles_media_tools_and_parallel_results() {
         {"type":"function_call_output","call_id":"call-1","output":"file text"},
         {"type":"custom_tool_call_output","call_id":"call-2","output":[{"type":"input_text","text":"patched"},{"type":"input_image","image_url":"data:image/png;base64,aGVsbG8="}]}
     ],"tools":[{"type":"namespace","name":"functions","tools":[{"type":"function","name":"read","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}]},{"type":"custom","name":"apply_patch","description":"Apply a patch","format":{"type":"grammar","syntax":"lark","definition":"start: /.+/"}}]});
+    let native_bytes = serde_json::to_vec(&body).unwrap();
+    assert_eq!(
+        prepare(UpstreamApi::Responses, &native_bytes, false)
+            .unwrap()
+            .bytes,
+        native_bytes
+    );
     let chat = request(UpstreamApi::ChatCompletions, body.clone());
+    assert!(chat.get("client_metadata").is_none());
     assert_eq!(chat["messages"][0]["role"], "system");
     assert_eq!(chat["messages"][1]["role"], "system");
     assert_eq!(
@@ -70,6 +78,7 @@ fn request_conversions_preserve_roles_media_tools_and_parallel_results() {
         .unwrap()
         .contains("grammar"));
     let anthropic = request(UpstreamApi::AnthropicMessages, body.clone());
+    assert!(anthropic.get("client_metadata").is_none());
     assert!(anthropic["system"]
         .as_str()
         .unwrap()
@@ -91,6 +100,7 @@ fn request_conversions_preserve_roles_media_tools_and_parallel_results() {
         "image"
     );
     let gemini = request(UpstreamApi::Gemini, body);
+    assert!(gemini.get("client_metadata").is_none());
     assert_eq!(
         gemini["systemInstruction"]["parts"]
             .as_array()

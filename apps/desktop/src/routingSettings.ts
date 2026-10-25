@@ -51,7 +51,7 @@ export function parseRoutingDraft(draft: RoutingDraft): { settings: RoutingSetti
   if (!ipv4 && !ipv6) errors.listenAddress = "IPv4 / IPv6 / localhost";
   const port = Number(draft.listenPort);
   if (!/^\d+$/.test(draft.listenPort.trim()) || port < 1024 || port > 65535) errors.listenPort = "1024–65535";
-  if (draft.providerIds.length > 64 || new Set(draft.providerIds).size !== draft.providerIds.length) errors.providerIds = "1–64";
+  if (draft.providerIds.length > 64 || new Set(draft.providerIds).size !== draft.providerIds.length) errors.providerIds = "0–64";
   return { errors, settings: Object.keys(errors).length ? null : {
     ...draft, ...numbers, version: 2, listenAddress: address, listenPort: port, providerIds: [...draft.providerIds],
   } };

@@ -690,6 +690,7 @@ fn route(provider: &SavedProvider) -> Result<ProxyRoute> {
         api_key,
         headers,
         models: provider_models(provider).into_iter().collect(),
+        default_model: provider.model.clone(),
     })
 }
 
@@ -770,6 +771,7 @@ fn route_plan(dir: &Path, settings: &FailoverSettings) -> Result<(Vec<ProxyRoute
     let options = ProxyOptions {
         auto_failover_enabled: false,
         tuning: settings.tuning,
+        source_model: None,
     };
     if !settings.takeover_enabled {
         return Ok((vec![], options));
@@ -779,11 +781,16 @@ fn route_plan(dir: &Path, settings: &FailoverSettings) -> Result<(Vec<ProxyRoute
     if primary.official.is_some() || !settings.auto_failover_enabled {
         return Ok((vec![primary], options));
     }
+    let source_model = list_saved_providers_on_connection(&crate::app_db::open()?)?
+        .into_iter()
+        .find(|provider| provider.id == primary.id)
+        .map(|provider| provider.model);
     Ok((
         queue_routes(settings)?,
         ProxyOptions {
             auto_failover_enabled: true,
             tuning: settings.tuning,
+            source_model,
         },
     ))
 }
@@ -832,6 +839,7 @@ fn start_listener(dir: &Path, record: &Record) -> Result<Running> {
         .map(Ok)
         .unwrap_or_else(random_token)?;
     let options = ProxyOptions {
+        source_model: None,
         auto_failover_enabled: false,
         tuning: record.settings.tuning,
     };
@@ -869,6 +877,11 @@ fn update_runtime(
     routes: Vec<ProxyRoute>,
     options: ProxyOptions,
 ) -> Result<()> {
+    // Periodic route inspection must not invalidate requests that are still
+    // using the same transport snapshot. Real changes still advance revision.
+    if runtime.routes == routes && runtime.options == options {
+        return Ok(());
+    }
     runtime.proxy.configure(routes.clone(), options.clone())?;
     runtime.routes = routes;
     runtime.options = options;
@@ -892,6 +905,16 @@ fn attach_route(dir: &Path, record: &mut Record, runtime: &mut Running) -> Resul
     let primary = current_route(dir)?
         .ok_or_else(|| CodexxError::Config("当前没有可接管的 Codex 供应商".into()))?;
     let (routes, options) = route_plan(dir, &record.settings)?;
+    // An explicit activation must not install an unusable automatic route.
+    // Periodic refresh still removes deleted members, including the last one,
+    // so it can never keep forwarding to a provider the user has removed.
+    if options.auto_failover_enabled
+        && (routes.is_empty() || routes.len() != record.settings.provider_ids.len())
+    {
+        return Err(CodexxError::Config(
+            "自动切换队列没有可用供应商，请先添加供应商，或关闭自动切换后再启用当前供应商".into(),
+        ));
+    }
     let key = direct
         .get("model_provider")
         .and_then(Item::as_str)
@@ -970,6 +993,7 @@ fn detach_route(dir: &Path, record: &Record, runtime: &mut Running) -> Result<()
         runtime,
         vec![],
         ProxyOptions {
+            source_model: None,
             auto_failover_enabled: false,
             tuning: record.settings.tuning,
         },
@@ -1217,6 +1241,26 @@ pub(crate) fn save_settings(
             "请先开启路由服务和 Codex 请求接管".into(),
         ));
     }
+    if settings.router_enabled
+        && settings.takeover_enabled
+        && settings.auto_failover_enabled
+        && current_route(&dir)?.is_some_and(|route| route.official.is_none())
+    {
+        if !enable_auto && settings.provider_ids.is_empty() {
+            return Err(CodexxError::Config(
+                "自动故障转移需要至少一个供应商；请加入队列，或关闭自动故障转移。".into(),
+            ));
+        }
+        // Missing/invalid saved members must not trap a user trying to stop
+        // the router. Eligibility is checked only while saving an active queue.
+        if !settings.provider_ids.is_empty()
+            && queue_routes(&settings)?.len() != settings.provider_ids.len()
+        {
+            return Err(CodexxError::Config(
+                "队列包含已删除或配置不可用的供应商，请修正队列后再启用自动故障转移。".into(),
+            ));
+        }
+    }
     let before = FileCheckpoint::capture(&dir)?;
     let mut expected = before.clone();
     let mut runtime = runtimes.remove(&dir);
@@ -1230,6 +1274,7 @@ pub(crate) fn save_settings(
         .as_ref()
         .map(|r| r.options.clone())
         .unwrap_or(ProxyOptions {
+            source_model: None,
             auto_failover_enabled: false,
             tuning: old.settings.tuning,
         });
@@ -1556,6 +1601,21 @@ fn record_selection(
             ROUTE_GENERATION_HEADER,
             value(next.lease_id.as_ref().unwrap().clone()),
         );
+    let selected_model = notice
+        .event
+        .model
+        .as_ref()
+        .filter(|_| {
+            runtime
+                .options
+                .source_model
+                .as_deref()
+                .is_some_and(|expected| doc.get("model").and_then(Item::as_str) == Some(expected))
+        })
+        .cloned();
+    if let Some(model) = selected_model.as_deref() {
+        doc["model"] = value(model);
+    }
     let transaction = conn
         .unchecked_transaction()
         .map_err(|e| CodexxError::Database(e.to_string()))?;
@@ -1581,6 +1641,11 @@ fn record_selection(
         return Err(CodexxError::Database(error.to_string()));
     }
     *journal = next;
+    if let Some(model) = selected_model {
+        let mut options = runtime.options.clone();
+        options.source_model = Some(model);
+        update_runtime(runtime, runtime.routes.clone(), options)?;
+    }
     changed(&notice.dir);
     Ok(())
 }

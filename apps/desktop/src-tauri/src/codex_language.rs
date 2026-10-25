@@ -501,7 +501,7 @@ fn bootstrap_once(
         progress(
             &state,
             "failed",
-            &format!("本次语言应用未完成：{last_error} 已停止自动处理，可手动重启后重试。"),
+            &format!("本次语言应用未完成：{last_error} 已停止自动处理；如需重新应用，请先关闭并应用语言开关，再重新开启。"),
             0,
         );
     }
@@ -764,29 +764,46 @@ impl Drop for PreparedRuntime {
     }
 }
 
-/// The settings restart button and toast share the language-aware launch path.
-/// Inspection does not change preferences, settings, or the running client.
-pub(crate) fn restart_client(config_dir: Option<String>) -> Result<(String, bool)> {
+/// Consume an explicit switch change once. A saved Chinese locale is not an
+/// instruction to attach a debugger or reapply compatibility on every restart.
+pub(crate) fn restart_client(config_dir: Option<String>) -> Result<(String, bool, Option<String>)> {
     let _operation = operation()
         .lock()
         .map_err(|_| CodexxError::Config("已有语言或重启操作正在进行".into()))?;
-    let scope = crate::paths::normalized_path_scope(&config_home(config_dir.clone())?);
-    let has_runtime = {
-        let active = runtime()
+    let home = config_home(config_dir.clone())?;
+    let scope = crate::paths::normalized_path_scope(&home);
+    let previous = {
+        let mut active = runtime()
             .lock()
             .map_err(|_| CodexxError::Config("语言兼容状态忙，请重试".into()))?;
         let running = active.as_ref().filter(|item| item.is_running());
         scope_available(running.map(|item| item.scope.as_str()), &scope)?;
-        running.is_some()
+        active.take()
     };
-    let status = get_status(config_dir.clone())?;
-    if (status.supported || cfg!(target_os = "windows"))
-        && (status.enabled || status.pending_enabled.is_some() || has_runtime)
-    {
-        let applied = apply_locked(config_dir, false)?;
-        return Ok((applied.app_name.unwrap_or_else(|| "Codex".into()), true));
+    // Cancel any unfinished one-shot setup before restarting. It must not race
+    // the new process, and its old progress is not the new client's status.
+    if let Some(previous) = previous {
+        previous.stop();
     }
-    crate::platform::restart_codex_desktop().map_err(CodexxError::Config)
+    let pending = read_preferences(&home).and_then(|(_, prefs)| {
+        if prefs.pending.is_none() {
+            return Ok(None);
+        }
+        let (_, doc) = document(&home)?;
+        Ok(pending_enabled(&prefs, &locale_value(&doc)?))
+    });
+    if matches!(pending, Ok(Some(_))) {
+        let (app_name, warning) = apply_locked(config_dir, false)?;
+        return Ok((app_name, true, warning));
+    }
+    // Reading language bookkeeping is not a prerequisite for a normal launch.
+    // Preserve an unreadable record and report it separately from process startup.
+    let warning = pending
+        .err()
+        .map(|error| format!("未应用语言更改，已保留原配置：{error}"));
+    let (app_name, was_running) =
+        crate::platform::restart_codex_desktop(&home).map_err(CodexxError::Config)?;
+    Ok((app_name, was_running, warning))
 }
 
 /// Explicit user action only. Never called during status reads or app startup.
@@ -794,10 +811,11 @@ pub(crate) fn apply(config_dir: Option<String>, restore: bool) -> Result<Languag
     let _operation = operation()
         .lock()
         .map_err(|_| CodexxError::Config("已有语言操作正在进行".into()))?;
-    apply_locked(config_dir, restore)
+    apply_locked(config_dir.clone(), restore)?;
+    get_status(config_dir)
 }
 
-fn apply_locked(config_dir: Option<String>, restore: bool) -> Result<LanguageStatus> {
+fn apply_locked(config_dir: Option<String>, restore: bool) -> Result<(String, Option<String>)> {
     let home = config_home(config_dir.clone())?;
     let scope = crate::paths::normalized_path_scope(&home);
     {
@@ -816,8 +834,13 @@ fn apply_locked(config_dir: Option<String>, restore: bool) -> Result<LanguageSta
     let (_, initial) = document(&home)?;
     let actual = locale_value(&initial)?;
     let mode = plan_apply(&prefs, &actual, restore)?;
+    // A retry after the preference was written only needs a normal launch and
+    // intent cleanup. Never repeat injection because bookkeeping failed later.
     let compatibility = matches!(&mode, EditMode::Enable)
-        || matches!(&mode, EditMode::Restart(locale) if chinese_enabled(locale.as_deref()));
+        && prefs
+            .pending
+            .as_ref()
+            .is_none_or(|pending| pending.written_locale.is_none());
     let app = desktop::detect_for_operation().map_err(CodexxError::Config)?;
     desktop::validate(&app).map_err(CodexxError::Config)?;
     desktop::validate_launch(&app, &home).map_err(CodexxError::Config)?;
@@ -832,7 +855,6 @@ fn apply_locked(config_dir: Option<String>, restore: bool) -> Result<LanguageSta
     } else {
         None
     };
-    desktop::quit(&app).map_err(CodexxError::Config)?;
     let previous = runtime()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -840,8 +862,10 @@ fn apply_locked(config_dir: Option<String>, restore: bool) -> Result<LanguageSta
     if let Some(previous) = previous {
         previous.stop();
     }
+    desktop::quit(&app).map_err(CodexxError::Config)?;
     let started_pid = std::cell::Cell::new(None);
-    complete_after_quit(
+    let recovered = std::cell::Cell::new(false);
+    let startup = complete_after_quit(
         || {
             edit_stopped_locale(&home, &mut prefs, bytes.as_deref(), &mode, || {
                 desktop::ensure_stopped(&app)
@@ -852,17 +876,12 @@ fn apply_locked(config_dir: Option<String>, restore: bool) -> Result<LanguageSta
                     .map_err(CodexxError::Config)?;
                 started_pid.set(Some(pid));
                 let active = pending.activate(pid)?;
-                if let Err(error) = finish_language_apply(&home, &mut prefs, &mode) {
-                    active.stop();
-                    return Err(error);
-                }
                 *runtime()
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(active);
             } else {
                 let pid = desktop::launch(&app, &home, None).map_err(CodexxError::Config)?;
                 started_pid.set(Some(pid));
-                finish_language_apply(&home, &mut prefs, &mode)?;
             }
             Ok(())
         },
@@ -870,10 +889,23 @@ fn apply_locked(config_dir: Option<String>, restore: bool) -> Result<LanguageSta
             if let Some(pid) = started_pid.get() {
                 desktop::quit_spawned(&app, pid)?;
             }
-            desktop::launch(&app, &home, None).map(|_| ())
+            desktop::launch(&app, &home, None)?;
+            recovered.set(true);
+            Ok(())
         },
-    )?;
-    get_status(config_dir)
+    );
+    if let Err(error) = startup {
+        if recovered.get() {
+            return Ok((app.name, Some(error.to_string())));
+        }
+        return Err(error);
+    }
+    // The process is running. A failed bookkeeping commit must not quit it or
+    // turn a successful start into a restart failure. Keep the intent for cleanup.
+    let warning = finish_language_apply(&home, &mut prefs, &mode)
+        .err()
+        .map(|error| format!("语言偏好已写入，但完成记录未保存：{error}；下次重启不会重复注入。"));
+    Ok((app.name, warning))
 }
 
 #[cfg(test)]

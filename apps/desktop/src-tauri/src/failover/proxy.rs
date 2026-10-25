@@ -35,6 +35,7 @@ pub(crate) struct ProxyRoute {
     pub(crate) api_key: Option<String>,
     pub(crate) headers: Vec<(String, String)>,
     pub(crate) models: HashSet<String>,
+    pub(crate) default_model: String,
     pub(crate) official: Option<OfficialRouteSpec>,
     pub(crate) protocol: UpstreamApi,
 }
@@ -71,12 +72,14 @@ pub(crate) struct ProxyProviderHealth {
 pub(crate) struct ProxyOptions {
     pub(crate) auto_failover_enabled: bool,
     pub(crate) tuning: RoutingTuning,
+    pub(crate) source_model: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct ProxySelectionEvent {
     pub(crate) provider_id: String,
     pub(crate) revision: u64,
+    pub(crate) model: Option<String>,
 }
 
 type SelectionCallback = Arc<dyn Fn(ProxySelectionEvent) + Send + Sync>;
@@ -350,6 +353,7 @@ impl ProxyHandle {
         timeout: Duration,
     ) -> Result<Self> {
         let options = ProxyOptions {
+            source_model: None,
             auto_failover_enabled: true,
             tuning: RoutingTuning {
                 circuit_failure_threshold: 1,
@@ -441,6 +445,7 @@ fn same_transport(left: &ProxyRoute, right: &ProxyRoute) -> bool {
         && left.api_key == right.api_key
         && left.headers == right.headers
         && left.models == right.models
+        && left.default_model == right.default_model
         && left.official == right.official
 }
 
@@ -1024,7 +1029,16 @@ fn decode_content_encoding(
     Ok(bytes)
 }
 
+#[cfg(test)]
 fn upstream_url(route: &ProxyRoute, data: &RequestData) -> Option<String> {
+    upstream_url_with_model(route, data, data.model.as_deref())
+}
+
+fn upstream_url_with_model(
+    route: &ProxyRoute,
+    data: &RequestData,
+    request_model: Option<&str>,
+) -> Option<String> {
     let mut url = reqwest::Url::parse(&route.base_url).ok()?;
     let base_path = url.path().trim_end_matches('/');
     // Saved base_url is the API prefix, matching Codex's own /responses join.
@@ -1055,11 +1069,9 @@ fn upstream_url(route: &ProxyRoute, data: &RequestData) -> Option<String> {
             }
         }
         UpstreamApi::Gemini => {
-            let model = data
-                .model
-                .as_deref()?
+            let model = request_model?
                 .strip_prefix("models/")
-                .unwrap_or(data.model.as_deref()?);
+                .unwrap_or(request_model?);
             if model.is_empty() || model.contains('/') || model.contains(':') {
                 return None;
             }
@@ -1233,12 +1245,13 @@ fn request_upstream(
     timing: RequestTimeouts,
     official: Option<&OfficialRequestAuth>,
     body: &[u8],
+    model: &str,
 ) -> std::result::Result<UpstreamResponse, ()> {
     let mut effective = route.clone();
     if let Some(auth) = official {
         effective.base_url = auth.base_url.clone();
     }
-    let url = upstream_url(&effective, data).ok_or(())?;
+    let url = upstream_url_with_model(&effective, data, Some(model)).ok_or(())?;
     let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(CONNECT_TIMEOUT)
@@ -1451,6 +1464,17 @@ fn bridge_buffered(
     prepared: &protocol::PreparedRequest,
 ) -> io::Result<BufferedResponse> {
     if route.protocol == UpstreamApi::Responses {
+        if response.status < 300
+            && serde_json::from_slice::<Value>(&response.bytes)
+                .ok()
+                .as_ref()
+                .is_some_and(super::native_stream::response_failure)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Responses 上游返回了 HTTP 200 失败响应",
+            ));
+        }
         return Ok(response);
     }
     let body: Value = serde_json::from_slice(&response.bytes)
@@ -1611,14 +1635,33 @@ fn set_success(
     permit: &mut Permit,
     index: usize,
     status: u16,
+    model: Option<&str>,
+    mapped_default: bool,
 ) {
+    record_completed_success(shared, permit);
+    set_selection(shared, config, route, index, status, model, mapped_default);
+}
+
+fn record_completed_success(shared: &Shared, permit: &mut Permit) {
     permit.success();
+    let mut stats = lock(&shared.statistics);
+    stats.success_count = stats.success_count.saturating_add(1);
+}
+
+fn set_selection(
+    shared: &Shared,
+    config: &Configuration,
+    route: &ProxyRoute,
+    index: usize,
+    status: u16,
+    model: Option<&str>,
+    mapped_default: bool,
+) {
     let current = shared
         .configuration
         .read()
         .unwrap_or_else(|error| error.into_inner());
     let mut stats = lock(&shared.statistics);
-    stats.success_count = stats.success_count.saturating_add(1);
     if current.revision != config.revision || shared.stopped.load(Ordering::Acquire) {
         return;
     }
@@ -1632,12 +1675,17 @@ fn set_success(
     stats.last_error = None;
     drop(stats);
     drop(current);
-    if route.official.is_none() {
+    if route.official.is_none() && model.is_some() {
         let callback = lock(&shared.selection_callback).clone();
         if let Some(callback) = callback {
             callback(ProxySelectionEvent {
                 provider_id: route.id.clone(),
                 revision: config.revision,
+                model: if mapped_default {
+                    model.map(ToString::to_string)
+                } else {
+                    None
+                },
             });
         }
     }
@@ -1696,7 +1744,7 @@ fn handle_request(mut request: Request, shared: &Arc<Shared>) {
                     half_open: false,
                     completed: false,
                 };
-                set_success(shared, &config, route, &mut permit, 0, 200);
+                set_success(shared, &config, route, &mut permit, 0, 200, None, false);
                 respond_buffered(
                     request,
                     BufferedResponse {
@@ -1725,6 +1773,15 @@ fn handle_request(mut request: Request, shared: &Arc<Shared>) {
         return;
     }
     let automatic = config.options.auto_failover_enabled && !official;
+    let uses_default_model = automatic
+        && !data.primary_only
+        && data.model.as_deref().is_some_and(|model| {
+            config.options.source_model.as_deref() == Some(model)
+                || config
+                    .routes
+                    .first()
+                    .is_some_and(|route| route.default_model == model)
+        });
     let max_attempts = if automatic {
         config.options.tuning.max_retries.saturating_add(1) as usize
     } else {
@@ -1752,6 +1809,19 @@ fn handle_request(mut request: Request, shared: &Arc<Shared>) {
                 context: protocol::ToolContext::default(),
                 model: String::new(),
             })
+        } else if uses_default_model
+            && !route.default_model.is_empty()
+            && data.model.as_deref() != Some(route.default_model.as_str())
+        {
+            // Only explicit default aliases may follow a supplier's own
+            // default. Preserve manually selected models and opaque state.
+            let mut body: Value = serde_json::from_slice(&data.bytes).expect("validated request");
+            body["model"] = json!(route.default_model);
+            protocol::prepare(
+                route.protocol,
+                &serde_json::to_vec(&body).expect("JSON value"),
+                data.suffix == "responses/compact",
+            )
         } else {
             protocol::prepare(
                 route.protocol,
@@ -1766,6 +1836,7 @@ fn handle_request(mut request: Request, shared: &Arc<Shared>) {
                 return;
             }
         };
+        let attempted_model = data.model.as_ref().map(|_| prepared.model.clone());
         let Some(mut permit) = Permit::acquire(&breakers, route, automatic) else {
             continue;
         };
@@ -1776,6 +1847,7 @@ fn handle_request(mut request: Request, shared: &Arc<Shared>) {
             timing,
             official_auth.as_ref(),
             &prepared.bytes,
+            &prepared.model,
         ) {
             Ok(response) => response,
             Err(()) => {
@@ -1850,7 +1922,16 @@ fn handle_request(mut request: Request, shared: &Arc<Shared>) {
         if !data.streaming && streaming && route.protocol.requires_routing() {
             match bridge_nonstream_sse(response, route, &prepared) {
                 Ok(response) => {
-                    set_success(shared, &config, route, &mut permit, index, status);
+                    set_success(
+                        shared,
+                        &config,
+                        route,
+                        &mut permit,
+                        index,
+                        status,
+                        attempted_model.as_deref(),
+                        uses_default_model,
+                    );
                     respond_buffered(request, response);
                     return;
                 }
@@ -1874,21 +1955,42 @@ fn handle_request(mut request: Request, shared: &Arc<Shared>) {
                 headers.retain(|(name, _)| !name.eq_ignore_ascii_case("content-type"));
                 headers.push(("content-type".into(), "text/event-stream".into()));
             }
-            let mut bridge_failure = None;
-            let mut reader: Box<dyn Read + Send + Sync> = if route.protocol.requires_routing() {
-                let converted = protocol::ResponseStream::new(
+            let mut first = [0; 16 * 1024];
+            let original_deadline = response.deadline;
+            let mut response = response;
+            // Heartbeats and lifecycle frames are not a first useful output.
+            // Bound their combined wait rather than resetting it on each chunk.
+            if data.streaming {
+                if let Some(timeout) = timing.first_chunk {
+                    let first_deadline = Instant::now() + timeout;
+                    response.deadline = Some(
+                        original_deadline.map_or(first_deadline, |total| total.min(first_deadline)),
+                    );
+                }
+            }
+            let (reader, first_read, stream_failure): (
+                Box<dyn Read + Send + Sync>,
+                io::Result<usize>,
+                Arc<AtomicBool>,
+            ) = if route.protocol.requires_routing() {
+                let mut converted = protocol::ResponseStream::new(
                     response,
                     route.protocol,
                     prepared.context,
                     prepared.model,
                 );
-                bridge_failure = Some(converted.failure_flag());
-                Box::new(converted)
+                let flag = converted.failure_flag();
+                let first_read = converted.read(&mut first);
+                converted.upstream_mut().deadline = original_deadline;
+                (Box::new(converted), first_read, flag)
             } else {
-                Box::new(response)
+                let mut native = super::native_stream::NativeResponseStream::new(response);
+                let flag = native.failure_flag();
+                let first_read = native.read(&mut first);
+                native.upstream_mut().deadline = original_deadline;
+                (Box::new(native), first_read, flag)
             };
-            let mut first = [0; 16 * 1024];
-            let count = match reader.read(&mut first) {
+            let count = match first_read {
                 Ok(0) => {
                     set_attempt_failure(
                         shared,
@@ -1904,9 +2006,7 @@ fn handle_request(mut request: Request, shared: &Arc<Shared>) {
                     continue;
                 }
                 Err(error) => {
-                    if route.protocol.requires_routing() {
-                        last_bridge_error = Some(error.to_string());
-                    }
+                    last_bridge_error = Some(error.to_string());
                     set_attempt_failure(
                         shared,
                         &config,
@@ -1922,16 +2022,53 @@ fn handle_request(mut request: Request, shared: &Arc<Shared>) {
                 }
                 Ok(count) => count,
             };
-            set_success(shared, &config, route, &mut permit, index, status);
-            if matches!(
-                stream_response(request, status, headers, &first[..count], reader),
-                StreamOutcome::UpstreamFailure
-            ) || bridge_failure.is_some_and(|flag| flag.load(Ordering::Acquire))
-            {
-                // Like CC Switch, after the committed first chunk this is a
-                // downstream stream failure, never a fresh provider attempt.
-                let mut stats = lock(&shared.statistics);
-                stats.last_error = Some("响应中断或超过静默时间，请重试本次请求".into());
+            set_selection(
+                shared,
+                &config,
+                route,
+                index,
+                status,
+                attempted_model.as_deref(),
+                uses_default_model,
+            );
+            match stream_response(request, status, headers, &first[..count], reader) {
+                // A client cancellation is neutral unless an upstream failure
+                // was already observed before the client disconnected.
+                StreamOutcome::ClientClosed if !stream_failure.load(Ordering::Acquire) => {}
+                StreamOutcome::Complete if !stream_failure.load(Ordering::Acquire) => {
+                    record_completed_success(shared, &mut permit);
+                }
+                StreamOutcome::Complete
+                | StreamOutcome::UpstreamFailure
+                | StreamOutcome::ClientClosed => {
+                    // Output has already committed: count the upstream failure
+                    // for the next request, never replay this one elsewhere.
+                    set_attempt_failure(
+                        shared,
+                        &config,
+                        route,
+                        &mut permit,
+                        Some(status),
+                        "响应中断或超过静默时间，请重试本次请求",
+                    );
+                    fail_request(shared);
+                    // Our own selection notice may already have advanced the
+                    // model snapshot revision. Keep this failure visible only
+                    // while the same supplier transport remains selected.
+                    let current = shared
+                        .configuration
+                        .read()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let mut stats = lock(&shared.statistics);
+                    if stats.last_provider_id.as_deref() == Some(route.id.as_str())
+                        && current
+                            .routes
+                            .iter()
+                            .any(|saved| saved.id == route.id && same_transport(saved, route))
+                    {
+                        stats.last_error = Some("响应中断或超过静默时间，请重试本次请求".into());
+                    }
+                }
             }
             return;
         }
@@ -1939,7 +2076,16 @@ fn handle_request(mut request: Request, shared: &Arc<Shared>) {
             .and_then(|response| bridge_buffered(response, route, &prepared))
         {
             Ok(response) => {
-                set_success(shared, &config, route, &mut permit, index, status);
+                set_success(
+                    shared,
+                    &config,
+                    route,
+                    &mut permit,
+                    index,
+                    status,
+                    attempted_model.as_deref(),
+                    uses_default_model,
+                );
                 respond_buffered(request, response);
                 return;
             }
@@ -1970,7 +2116,7 @@ fn handle_request(mut request: Request, shared: &Arc<Shared>) {
             Err(_) => respond_error(request, 502, "暂时无法连接可用供应商，请稍后重试"),
         }
     } else if let Some(error) = last_bridge_error {
-        respond_error(request, 502, &format!("上游协议转换失败：{error}"));
+        respond_error(request, 502, &format!("上游响应读取或转换失败：{error}"));
     } else if attempted > 0 {
         respond_error(request, 502, "暂时无法连接可用供应商，请稍后重试");
     } else {
@@ -2212,6 +2358,7 @@ mod tests {
 
     fn route(id: &str, upstream: &Upstream, key: &str) -> ProxyRoute {
         ProxyRoute {
+            default_model: MODEL.into(),
             id: id.into(),
             name: id.into(),
             base_url: upstream.url.clone(),
@@ -2759,8 +2906,13 @@ mod tests {
         assert!(partial.contains("first"));
         assert!(backup.observed().is_empty());
         eventually(|| proxy.snapshot().in_flight == 0);
-        assert_eq!(proxy.snapshot().providers[0].state, "closed");
-        assert_eq!(proxy.snapshot().failover_count, 0);
+        let snapshot = proxy.snapshot();
+        assert_eq!(snapshot.providers[0].state, "open");
+        assert_eq!(snapshot.providers[0].total_requests, 1);
+        assert_eq!(snapshot.providers[0].failed_requests, 1);
+        assert_eq!(snapshot.success_count, 0);
+        assert_eq!(snapshot.failure_count, 1);
+        assert_eq!(snapshot.failover_count, 0);
     }
 
     #[test]
@@ -3037,6 +3189,7 @@ mod tests {
             TOKEN.into(),
             routes,
             ProxyOptions {
+                source_model: None,
                 auto_failover_enabled: automatic,
                 tuning,
             },
@@ -3071,6 +3224,7 @@ mod tests {
             .configure(
                 routes.clone(),
                 ProxyOptions {
+                    source_model: None,
                     auto_failover_enabled: true,
                     tuning: RoutingTuning {
                         max_retries: 1,
@@ -3088,6 +3242,7 @@ mod tests {
             .configure(
                 routes.clone(),
                 ProxyOptions {
+                    source_model: None,
                     auto_failover_enabled: true,
                     tuning: RoutingTuning {
                         max_retries: 2,
@@ -3105,6 +3260,7 @@ mod tests {
             .configure(
                 routes,
                 ProxyOptions {
+                    source_model: None,
                     auto_failover_enabled: false,
                     tuning: RoutingTuning {
                         max_retries: 10,
@@ -3151,6 +3307,7 @@ mod tests {
             .configure(
                 routes,
                 ProxyOptions {
+                    source_model: None,
                     auto_failover_enabled: true,
                     tuning: RoutingTuning {
                         max_retries: 0,
@@ -3182,6 +3339,7 @@ mod tests {
             .configure(
                 Vec::new(),
                 ProxyOptions {
+                    source_model: None,
                     auto_failover_enabled: true,
                     tuning,
                 },
@@ -3215,6 +3373,7 @@ mod tests {
             .configure(
                 routes.clone(),
                 ProxyOptions {
+                    source_model: None,
                     auto_failover_enabled: true,
                     tuning: RoutingTuning::default(),
                 },
@@ -3229,6 +3388,7 @@ mod tests {
             .configure(
                 vec![routes[1].clone(), routes[0].clone()],
                 ProxyOptions {
+                    source_model: None,
                     auto_failover_enabled: true,
                     tuning: RoutingTuning::default(),
                 },
@@ -3294,6 +3454,7 @@ mod tests {
             .configure(
                 routes,
                 ProxyOptions {
+                    source_model: None,
                     auto_failover_enabled: true,
                     tuning: RoutingTuning {
                         streaming_first_byte_timeout: 4,
@@ -3335,6 +3496,7 @@ mod tests {
             .configure(
                 routes,
                 ProxyOptions {
+                    source_model: None,
                     auto_failover_enabled: true,
                     tuning: RoutingTuning {
                         streaming_idle_timeout: 0,
@@ -3376,6 +3538,7 @@ mod tests {
             .configure(
                 routes,
                 ProxyOptions {
+                    source_model: None,
                     auto_failover_enabled: true,
                     tuning: RoutingTuning {
                         non_streaming_timeout: 120,
@@ -3394,6 +3557,7 @@ mod tests {
     fn wildcard_listener_requires_valid_host_and_token_and_ipv6_urls_work() {
         let upstream = Upstream::json(200, "{}");
         let options = ProxyOptions {
+            source_model: None,
             auto_failover_enabled: false,
             tuning: RoutingTuning::default(),
         };

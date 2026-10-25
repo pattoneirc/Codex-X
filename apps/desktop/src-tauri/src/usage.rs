@@ -288,12 +288,182 @@ struct LogPayload {
     #[serde(alias = "threadId")]
     thread_id: Option<String>,
     forked_from_id: Option<String>,
+    #[serde(
+        default,
+        rename = "history_mode",
+        deserialize_with = "paginated_history_mode"
+    )]
+    paginated: bool,
+    #[serde(default)]
+    history_base: HistoryBase,
     source: Option<UsageSource>,
     thread_source: Option<String>,
     cwd: Option<String>,
     model: Option<String>,
     info: Option<TokenInfo>,
     rate_limits: Option<RateLimits>,
+}
+
+/// Invalid optional history metadata must not make an otherwise valid session
+/// or token event disappear. Unknown nested values are skipped without storage.
+#[derive(Default)]
+enum HistoryScalar {
+    Text(String),
+    Unsigned(u64),
+    #[default]
+    Other,
+}
+
+impl<'de> Deserialize<'de> for HistoryScalar {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct ScalarVisitor;
+        impl<'de> Visitor<'de> for ScalarVisitor {
+            type Value = HistoryScalar;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("optional history metadata")
+            }
+            fn visit_str<E: serde::de::Error>(
+                self,
+                value: &str,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(HistoryScalar::Text(value.into()))
+            }
+            fn visit_string<E: serde::de::Error>(
+                self,
+                value: String,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(HistoryScalar::Text(value))
+            }
+            fn visit_u64<E: serde::de::Error>(
+                self,
+                value: u64,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(HistoryScalar::Unsigned(value))
+            }
+            fn visit_i64<E: serde::de::Error>(self, _: i64) -> std::result::Result<Self::Value, E> {
+                Ok(HistoryScalar::Other)
+            }
+            fn visit_f64<E: serde::de::Error>(self, _: f64) -> std::result::Result<Self::Value, E> {
+                Ok(HistoryScalar::Other)
+            }
+            fn visit_bool<E: serde::de::Error>(
+                self,
+                _: bool,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(HistoryScalar::Other)
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> std::result::Result<Self::Value, E> {
+                Ok(HistoryScalar::Other)
+            }
+            fn visit_seq<A: SeqAccess<'de>>(
+                self,
+                mut values: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                while values.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(HistoryScalar::Other)
+            }
+            fn visit_map<M: MapAccess<'de>>(
+                self,
+                mut values: M,
+            ) -> std::result::Result<Self::Value, M::Error> {
+                while values.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                Ok(HistoryScalar::Other)
+            }
+        }
+        deserializer.deserialize_any(ScalarVisitor)
+    }
+}
+
+fn paginated_history_mode<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<bool, D::Error> {
+    Ok(
+        matches!(HistoryScalar::deserialize(deserializer)?, HistoryScalar::Text(mode) if mode == "paginated"),
+    )
+}
+
+#[derive(Debug, Clone, Default)]
+struct HistoryBase {
+    thread_id: Option<String>,
+    end_byte_offset: Option<u64>,
+    end_ordinal_exclusive: Option<u64>,
+}
+
+impl<'de> Deserialize<'de> for HistoryBase {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct BaseVisitor;
+        impl<'de> Visitor<'de> for BaseVisitor {
+            type Value = HistoryBase;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("optional history reference")
+            }
+            fn visit_map<M: MapAccess<'de>>(
+                self,
+                mut values: M,
+            ) -> std::result::Result<Self::Value, M::Error> {
+                let mut base = HistoryBase::default();
+                while let Some(key) = values.next_key::<String>()? {
+                    match key.as_str() {
+                        "thread_id" => {
+                            base.thread_id = match values.next_value::<HistoryScalar>()? {
+                                HistoryScalar::Text(id) => nonempty(Some(id)),
+                                _ => None,
+                            }
+                        }
+                        "end_byte_offset" => {
+                            base.end_byte_offset = match values.next_value::<HistoryScalar>()? {
+                                HistoryScalar::Unsigned(value) => Some(value),
+                                _ => None,
+                            }
+                        }
+                        "end_ordinal_exclusive" => {
+                            base.end_ordinal_exclusive =
+                                match values.next_value::<HistoryScalar>()? {
+                                    HistoryScalar::Unsigned(value) => Some(value),
+                                    _ => None,
+                                }
+                        }
+                        _ => {
+                            values.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(base)
+            }
+            fn visit_seq<A: SeqAccess<'de>>(
+                self,
+                mut values: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                while values.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(HistoryBase::default())
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> std::result::Result<Self::Value, E> {
+                Ok(HistoryBase::default())
+            }
+            fn visit_bool<E: serde::de::Error>(
+                self,
+                _: bool,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(HistoryBase::default())
+            }
+            fn visit_str<E: serde::de::Error>(
+                self,
+                _: &str,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(HistoryBase::default())
+            }
+            fn visit_i64<E: serde::de::Error>(self, _: i64) -> std::result::Result<Self::Value, E> {
+                Ok(HistoryBase::default())
+            }
+            fn visit_u64<E: serde::de::Error>(self, _: u64) -> std::result::Result<Self::Value, E> {
+                Ok(HistoryBase::default())
+            }
+            fn visit_f64<E: serde::de::Error>(self, _: f64) -> std::result::Result<Self::Value, E> {
+                Ok(HistoryBase::default())
+            }
+        }
+        deserializer.deserialize_any(BaseVisitor)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -317,6 +487,7 @@ struct TokenEvent {
     signature: Signature,
     model: String,
     source: Option<String>,
+    end_offset: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -346,6 +517,8 @@ struct ParsedLog {
     parent: Option<String>,
     invalid_parent: bool,
     replays_parent: bool,
+    forked_from_id: Option<String>,
+    history_base: Option<HistoryBase>,
     is_subagent: bool,
     spawn_parent: Option<String>,
     invalid_spawn_parent: bool,
@@ -366,6 +539,8 @@ impl Default for ParsedLog {
             parent: None,
             invalid_parent: false,
             replays_parent: false,
+            forked_from_id: None,
+            history_base: None,
             is_subagent: false,
             spawn_parent: None,
             invalid_spawn_parent: false,
@@ -390,7 +565,7 @@ fn timestamp(value: Option<&str>) -> Option<DateTime<Utc>> {
 }
 
 impl ParsedLog {
-    fn parse_record(&mut self, record: LogRecord) {
+    fn parse_record(&mut self, record: LogRecord, end_offset: u64) {
         let time = timestamp(record.timestamp.as_deref());
         if let Some(time) = time {
             self.max_timestamp = Some(
@@ -413,6 +588,10 @@ impl ParsedLog {
                     .as_ref()
                     .and_then(|value| value.parent.clone());
                 let forked = nonempty(payload.forked_from_id);
+                self.forked_from_id = forked.clone();
+                if payload.paginated {
+                    self.history_base = Some(payload.history_base);
+                }
                 let spawned = nonempty(spawned);
                 self.is_subagent = payload
                     .source
@@ -485,6 +664,7 @@ impl ParsedLog {
                     source: payload
                         .rate_limits
                         .and_then(|value| nonempty(value.limit_id)),
+                    end_offset,
                 });
             }
             _ => {}
@@ -532,6 +712,8 @@ impl FileStamp {
 #[derive(Debug)]
 struct CachedFile {
     stamp: FileStamp,
+    // Plain logs use a file offset. Compressed histories use a decoded-record
+    // offset, reached only by streaming from the beginning, never a raw seek.
     offset: u64,
     boundary_hash: [u8; 32],
     prefix_hash: [u8; 32],
@@ -714,6 +896,9 @@ fn parse_file(
             "会话文件在扫描期间发生变化，请刷新重试".into(),
         ));
     }
+    if is_compressed_log(path) {
+        return parse_compressed_file(path, file, stamp, previous, force, budget);
+    }
     let mut offset = 0;
     let mut parsed = ParsedLog::default();
     if let Some(old) = previous {
@@ -751,7 +936,7 @@ fn parse_file(
         }
         *budget = budget.saturating_sub(line.consumed);
         match line.record {
-            Ok(Some(record)) => parsed.parse_record(record),
+            Ok(Some(record)) => parsed.parse_record(record, offset.saturating_add(line.consumed)),
             Ok(None) => {}
             Err(error) if !line.terminated && error.is_eof() => {
                 parsed.pending_line = true;
@@ -769,6 +954,135 @@ fn parse_file(
         offset,
         prefix_hash,
         boundary_hash,
+        parsed,
+        complete,
+    })
+}
+
+fn is_compressed_log(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|name| name.as_encoded_bytes().ends_with(b".jsonl.zst"))
+}
+
+fn logical_log_path(path: &Path) -> PathBuf {
+    if is_compressed_log(path) {
+        path.with_extension("")
+    } else {
+        path.to_path_buf()
+    }
+}
+
+fn compressed_log_path(logical: &Path) -> PathBuf {
+    let mut name = logical.as_os_str().to_os_string();
+    name.push(".zst");
+    PathBuf::from(name)
+}
+
+fn compressed_log_is_current(path: &Path) -> std::io::Result<bool> {
+    match fs::symlink_metadata(logical_log_path(path)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error),
+        // An expanded/current plain representation wins even if it is not a
+        // readable regular file. Do not silently fall back to its old archive.
+        Ok(_) => Ok(false),
+    }
+}
+
+fn parse_compressed_file(
+    path: &Path,
+    mut file: File,
+    stamp: FileStamp,
+    previous: Option<CachedFile>,
+    force: bool,
+    budget: &mut u64,
+) -> Result<CachedFile> {
+    if !compressed_log_is_current(path).map_err(|error| io_error(path, error))? {
+        return Err(CodexxError::Config(
+            "会话已展开为普通日志，请刷新统计".into(),
+        ));
+    }
+    let mut offset = 0;
+    let mut parsed = ParsedLog::default();
+    let raw_anchors = anchors(&mut file, stamp.len).map_err(|error| io_error(path, error))?;
+    if let Some(old) = previous {
+        if old.stamp == stamp && old.complete && !force {
+            return Ok(old);
+        }
+        // A changed compressed file is always decoded again from record zero.
+        // Only an unfinished scan of the same immutable representation resumes.
+        if old.stamp == stamp
+            && !old.complete
+            && (old.prefix_hash, old.boundary_hash) == raw_anchors
+        {
+            offset = old.offset;
+            parsed = old.parsed;
+        }
+    }
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| io_error(path, error))?;
+    let mut decoder =
+        zstd::stream::read::Decoder::new(&mut file).map_err(|error| io_error(path, error))?;
+    if offset != 0 {
+        // Replay decoding uses a fixed IO buffer and discards all contents.
+        // The scan budget measures newly inspected records, not this replay;
+        // charging it again would prevent large histories from ever completing.
+        let skipped = std::io::copy(&mut decoder.by_ref().take(offset), &mut std::io::sink())
+            .map_err(|error| io_error(path, error))?;
+        if skipped != offset {
+            return Err(CodexxError::Config("压缩会话长度已变化，请刷新统计".into()));
+        }
+    }
+    parsed.pending_line = false;
+    let mut reader = BufReader::new(decoder);
+    let mut complete = true;
+    loop {
+        // Reading through EOF also validates the final compressed frame. A
+        // damaged tail cannot publish a seemingly complete metadata prefix.
+        if reader
+            .fill_buf()
+            .map_err(|error| io_error(path, error))?
+            .is_empty()
+        {
+            break;
+        }
+        if *budget == 0 {
+            complete = false;
+            break;
+        }
+        let line = read_log_record(&mut reader).map_err(|error| io_error(path, error))?;
+        if line.consumed == 0 {
+            break;
+        }
+        *budget = budget.saturating_sub(line.consumed);
+        match line.record {
+            Ok(Some(record)) => parsed.parse_record(record, offset.saturating_add(line.consumed)),
+            Ok(None) => {}
+            Err(error) if !line.terminated && error.is_eof() => {
+                parsed.pending_line = true;
+                break;
+            }
+            Err(_) => parsed.issues.malformed_lines += 1,
+        }
+        offset += line.consumed;
+    }
+    drop(reader);
+    let after = fs::symlink_metadata(path).map_err(|error| io_error(path, error))?;
+    if !after.is_file()
+        || after.file_type().is_symlink()
+        || FileStamp::new(&after) != stamp
+        || FileStamp::new(&file.metadata().map_err(|error| io_error(path, error))?) != stamp
+        || !compressed_log_is_current(path).map_err(|error| io_error(path, error))?
+        || anchors(&mut file, stamp.len).map_err(|error| io_error(path, error))? != raw_anchors
+    {
+        return Err(CodexxError::Config(
+            "压缩会话在扫描期间发生变化，请刷新统计".into(),
+        ));
+    }
+    Ok(CachedFile {
+        stamp,
+        offset,
+        prefix_hash: raw_anchors.0,
+        boundary_hash: raw_anchors.1,
         parsed,
         complete,
     })
@@ -838,9 +1152,10 @@ fn collect_files(dir: &Path, depth: usize, files: &mut Vec<PathBuf>, coverage: &
                     .push("已跳过层级过深的会话目录，统计可能不完整。".into());
             }
         } else if kind.is_file()
-            && path
+            && (path
                 .extension()
                 .is_some_and(|extension| extension == "jsonl")
+                || is_compressed_log(&path))
         {
             files.push(path);
         }
@@ -925,21 +1240,33 @@ fn combine_files(
             .get(id)
             .and_then(|identity| identity.rollout_path.as_ref())
             .and_then(|path| {
-                cache.files.get(path).or_else(|| {
-                    let canonical = path.canonicalize().ok()?;
-                    canonical_files
-                        .get_or_insert_with(|| {
-                            cache
-                                .files
-                                .iter()
-                                .filter_map(|(path, entry)| {
-                                    path.canonicalize().ok().map(|path| (path, entry))
-                                })
-                                .collect()
-                        })
-                        .get(&canonical)
-                        .copied()
-                })
+                // Codex retains the logical .jsonl SQLite reference when it
+                // compresses that exact rollout. Never select a different
+                // historical/revert file merely because its thread ID matches.
+                let logical = logical_log_path(path);
+                let compressed = compressed_log_path(&logical);
+                cache
+                    .files
+                    .get(&logical)
+                    .or_else(|| cache.files.get(&compressed))
+                    .or_else(|| {
+                        let canonical = logical
+                            .canonicalize()
+                            .or_else(|_| compressed.canonicalize())
+                            .ok()?;
+                        canonical_files
+                            .get_or_insert_with(|| {
+                                cache
+                                    .files
+                                    .iter()
+                                    .filter_map(|(path, entry)| {
+                                        path.canonicalize().ok().map(|path| (path, entry))
+                                    })
+                                    .collect()
+                            })
+                            .get(&canonical)
+                            .copied()
+                    })
             })
             .map(|entry| &entry.parsed)
             .filter(|parsed| parsed.meta_seen && parsed.id.as_ref() == Some(id));
@@ -1059,16 +1386,132 @@ struct MeasurementIssues {
     recovered_baselines: usize,
 }
 
+fn uuid_name(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
+fn rollout_segment_ids(path: &Path) -> Option<(&str, &str)> {
+    let name = path.file_name()?.to_str()?;
+    let stem = name
+        .strip_suffix(".jsonl.zst")
+        .or_else(|| name.strip_suffix(".jsonl"))?;
+    if !stem.starts_with("rollout-") {
+        return None;
+    }
+    let (prefix, segment) = match stem.rsplit_once('_') {
+        Some((prefix, segment)) if uuid_name(segment) => (prefix, Some(segment)),
+        _ => (stem, None),
+    };
+    let logical = prefix.get(prefix.len().checked_sub(36)?..)?;
+    let separator = prefix.get(prefix.len().checked_sub(37)?..prefix.len() - 36)?;
+    (uuid_name(logical) && separator == "-").then_some((logical, segment.unwrap_or(logical)))
+}
+
+fn same_usage_record(first: &TokenEvent, other: &TokenEvent) -> bool {
+    first.timestamp == other.timestamp
+        && first.model == other.model
+        && first.signature == other.signature
+}
+
+/// A paginated fork can omit copied history while its cumulative counter still
+/// includes that history. Verify the exact referenced physical segment and
+/// checkpoint; never substitute the parent's latest total or infer a date/model.
+fn verified_inherited_baseline(
+    id: &str,
+    session: &SessionLog,
+    cache: &DirectoryCache,
+) -> Option<Counters> {
+    if !session.replays_parent || session.invalid_parent {
+        return None;
+    }
+    let parent = session.parent.as_deref()?;
+    let cutoff = session.started_at?;
+    let first = session.events.first()?;
+    if first.timestamp.is_none_or(|time| time < cutoff) {
+        return None;
+    }
+    let total = first.signature.total?;
+    let last = first.signature.last?;
+    let expected = Counters {
+        input: total.input.checked_sub(last.input)?,
+        cached: total.cached.checked_sub(last.cached)?,
+        output: total.output.checked_sub(last.output)?,
+        reasoning: total.reasoning.checked_sub(last.reasoning)?,
+    };
+    if expected.is_zero()
+        || expected.cached > expected.input
+        || expected.reasoning > expected.output
+    {
+        return None;
+    }
+    let mut verified = false;
+    for child in cache.files.values().filter(|entry| {
+        entry.parsed.id.as_deref() == Some(id)
+            && entry.parsed.forked_from_id.as_deref() == Some(parent)
+            && entry
+                .parsed
+                .events
+                .first()
+                .is_some_and(|event| same_usage_record(first, event))
+            && entry.parsed.history_base.is_some()
+    }) {
+        let base = child.parsed.history_base.as_ref()?;
+        let segment = base.thread_id.as_deref().filter(|id| uuid_name(id))?;
+        let boundary = base.end_byte_offset.filter(|offset| *offset > 0)?;
+        base.end_ordinal_exclusive.filter(|ordinal| *ordinal > 0)?;
+        let mut matched_segment = false;
+        for (path, source) in &cache.files {
+            if source.parsed.id.as_deref() != Some(parent)
+                || rollout_segment_ids(path) != Some((parent, segment))
+            {
+                continue;
+            }
+            // offset is the last completely parsed decoded-record boundary,
+            // including when the global scan budget paused this file.
+            if boundary > source.offset {
+                continue;
+            }
+            let checkpoint = source
+                .parsed
+                .events
+                .iter()
+                .filter(|event| event.end_offset <= boundary && event.signature.total.is_some())
+                .max_by_key(|event| event.end_offset)?;
+            if checkpoint.timestamp.is_none_or(|time| time > cutoff)
+                || checkpoint.signature.total != Some(expected)
+            {
+                return None;
+            }
+            matched_segment = true;
+        }
+        if !matched_segment {
+            return None;
+        }
+        verified = true;
+    }
+    verified.then_some(expected)
+}
+
 fn measured_events(
     session: &SessionLog,
     prefix: usize,
+    inherited_baseline: Option<Counters>,
 ) -> (Vec<MeasuredEvent<'_>>, MeasurementIssues) {
-    let mut high_water = Counters::default();
+    // This only initializes a de-duplication baseline. It must never become a
+    // usage event: the tokens belong to the parent's already-recorded history.
+    let mut high_water = inherited_baseline.unwrap_or_default();
     let mut by_source: HashMap<Option<&str>, &Signature> = HashMap::new();
     let mut previous_signature: Option<&Signature> = None;
     let mut result = Vec::new();
     let mut issues = MeasurementIssues::default();
-    let mut had_total = false;
+    let mut had_total = inherited_baseline.is_some();
     for (index, event) in session.events.iter().enumerate() {
         let signature = &event.signature;
         let duplicate = signature.total.is_some()
@@ -1278,7 +1721,12 @@ where
             coverage.skipped_files += session.files;
             continue;
         };
-        let (events, issues) = measured_events(session, prefix);
+        // A replayed token prefix already establishes its own baseline. Do not
+        // also apply the paginated checkpoint or count the copied last request.
+        let inherited_baseline = (prefix == 0)
+            .then(|| verified_inherited_baseline(id, session, cache))
+            .flatten();
+        let (events, issues) = measured_events(session, prefix, inherited_baseline);
         regressions += issues.regressions;
         missing_request_details += issues.missing_request_details;
         recovered_baselines += issues.recovered_baselines;
@@ -1461,6 +1909,21 @@ fn refresh_cache_with_budget(
     for directory in ["sessions", "archived_sessions"] {
         collect_files(&codex_dir.join(directory), 0, &mut files, &mut coverage);
     }
+    files.retain(|path| {
+        if !is_compressed_log(path) {
+            return true;
+        }
+        match compressed_log_is_current(path) {
+            Ok(current) => current,
+            Err(_) => {
+                coverage.skipped_files += 1;
+                coverage
+                    .warnings
+                    .push("部分会话的压缩状态无法确认，未使用可能过期的历史副本。".into());
+                false
+            }
+        }
+    });
     files.sort();
     let present: HashSet<_> = files.iter().cloned().collect();
     cache.files.retain(|path, _| present.contains(path));
@@ -1491,6 +1954,8 @@ fn refresh_cache_with_budget(
         if !verifying
             && cache.files.get(&path).is_some_and(|old| {
                 old.complete
+                    && (!is_compressed_log(&path)
+                        || compressed_log_is_current(&path).unwrap_or(false))
                     && fs::symlink_metadata(&path).ok().is_some_and(|metadata| {
                         metadata.is_file()
                             && !metadata.file_type().is_symlink()
@@ -1527,9 +1992,11 @@ fn refresh_cache_with_budget(
                 cache.force_remaining.remove(&path);
                 coverage.skipped_files += 1;
                 retained_cached_results |= verifying && cache.files.contains_key(&path);
-                coverage
-                    .warnings
-                    .push("部分会话文件无法读取，统计可能不完整。".into());
+                coverage.warnings.push(if is_compressed_log(&path) {
+                    "部分压缩会话文件无法完整读取或解压，统计可能不完整。".into()
+                } else {
+                    "部分会话文件无法读取，统计可能不完整。".into()
+                });
             }
         }
     }

@@ -174,7 +174,7 @@ pub(crate) fn prepare(
     bytes: &[u8],
     compact: bool,
 ) -> std::result::Result<PreparedRequest, String> {
-    let body: Value = serde_json::from_slice(bytes).map_err(|_| "请求不是有效的 JSON")?;
+    let mut body: Value = serde_json::from_slice(bytes).map_err(|_| "请求不是有效的 JSON")?;
     let model = body
         .get("model")
         .and_then(Value::as_str)
@@ -188,6 +188,12 @@ pub(crate) fn prepare(
         });
     }
     validate_fields(api, &body)?;
+    // Codex attaches client bookkeeping to every Responses request. It has no
+    // generation semantics and is not part of the converted upstream schemas.
+    // Keep native Responses bytes intact via the early return above.
+    if let Some(fields) = body.as_object_mut() {
+        fields.remove("client_metadata");
+    }
     if compact {
         return Err(
             "该上游协议不支持 Responses /compact；请使用 Codex 本地压缩或切换到 Responses 供应商"
@@ -1045,6 +1051,7 @@ fn validate_fields(api: UpstreamApi, body: &Value) -> std::result::Result<(), St
         "max_output_tokens",
         "parallel_tool_calls",
         "metadata",
+        "client_metadata",
         "store",
         "include",
         "truncation",

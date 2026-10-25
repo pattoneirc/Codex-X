@@ -1,5 +1,6 @@
 //! Read-only balances for saved providers and the current native provider.
-//! Request destinations are fixed official URLs, never supplied over IPC.
+//! Destinations are fixed official URLs or the provider's own saved Sub2API URL,
+//! never supplied over IPC.
 use crate::error::{CodexxError, Result};
 use crate::providers::{self, SavedProvider};
 use chrono::{SecondsFormat, Utc};
@@ -18,6 +19,7 @@ use toml_edit::{DocumentMut, Item};
 const SUCCESS_TTL: Duration = Duration::from_secs(300);
 const FAILURE_TTL: Duration = Duration::from_secs(60);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const SUB2API_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_RESPONSE_BYTES: u64 = 64 * 1024;
 const MAX_CACHE_ENTRIES: usize = 256;
 
@@ -42,12 +44,13 @@ pub(crate) struct ProviderBalanceResult {
     pub(crate) error_code: Option<&'static str>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Vendor {
     DeepSeek,
     OpenRouter,
     SiliconFlow,
     Moonshot,
+    Sub2Api,
 }
 impl Vendor {
     fn name(self) -> &'static str {
@@ -56,27 +59,25 @@ impl Vendor {
             Self::OpenRouter => "openrouter",
             Self::SiliconFlow => "siliconflow",
             Self::Moonshot => "moonshot",
-        }
-    }
-    fn endpoint(self) -> &'static str {
-        match self {
-            Self::DeepSeek => "https://api.deepseek.com/user/balance",
-            Self::OpenRouter => "https://openrouter.ai/api/v1/key",
-            Self::SiliconFlow => "https://api.siliconflow.cn/v1/user/info",
-            Self::Moonshot => "https://api.moonshot.cn/v1/users/me/balance",
+            Self::Sub2Api => "sub2api",
         }
     }
 }
 
-fn vendor_for_provider(provider: &SavedProvider) -> Option<Vendor> {
+struct BalanceTarget {
+    vendor: Vendor,
+    endpoint: reqwest::Url,
+}
+
+fn target_for_provider(provider: &SavedProvider) -> Option<BalanceTarget> {
     // This flag controls Codex authentication, and legacy third-party routes
-    // can also set it. Eligibility comes from the official API URL below;
+    // can also set it. Eligibility comes from the saved route below;
     // official login profiles are never enumerated by this module.
-    let url = reqwest::Url::parse(provider.base_url.trim()).ok()?;
-    if url.scheme() != "https"
+    let mut url = reqwest::Url::parse(provider.base_url.trim()).ok()?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
         || !url.username().is_empty()
         || url.password().is_some()
-        || url.port().is_some_and(|port| port != 443)
         || url.query().is_some()
         || url.fragment().is_some()
     {
@@ -87,10 +88,18 @@ fn vendor_for_provider(provider: &SavedProvider) -> Option<Vendor> {
         path,
         "" | "/v1" | "/v1/chat/completions" | "/v1/responses" | "/v1/messages"
     );
-    match url.host_str()? {
-        "api.deepseek.com" if normal_path => Some(Vendor::DeepSeek),
-        "api.siliconflow.cn" if normal_path => Some(Vendor::SiliconFlow),
-        "api.moonshot.cn" if normal_path => Some(Vendor::Moonshot),
+    let builtin = match url.host_str()? {
+        "api.deepseek.com" if normal_path => {
+            Some((Vendor::DeepSeek, "https://api.deepseek.com/user/balance"))
+        }
+        "api.siliconflow.cn" if normal_path => Some((
+            Vendor::SiliconFlow,
+            "https://api.siliconflow.cn/v1/user/info",
+        )),
+        "api.moonshot.cn" if normal_path => Some((
+            Vendor::Moonshot,
+            "https://api.moonshot.cn/v1/users/me/balance",
+        )),
         "openrouter.ai"
             if matches!(
                 path,
@@ -100,10 +109,47 @@ fn vendor_for_provider(provider: &SavedProvider) -> Option<Vendor> {
                     | "/api/v1/messages"
             ) =>
         {
-            Some(Vendor::OpenRouter)
+            Some((Vendor::OpenRouter, "https://openrouter.ai/api/v1/key"))
         }
         _ => None,
+    };
+    if let Some((vendor, endpoint)) = builtin {
+        // Built-in accounts retain the original strict official HTTPS origin.
+        if url.scheme() != "https" || url.port().is_some_and(|port| port != 443) {
+            return None;
+        }
+        return Some(BalanceTarget {
+            vendor,
+            endpoint: reqwest::Url::parse(endpoint).ok()?,
+        });
     }
+    if matches!(
+        url.host_str()?,
+        "api.deepseek.com"
+            | "api.siliconflow.cn"
+            | "api.moonshot.cn"
+            | "openrouter.ai"
+            | "api.openai.com"
+            | "chatgpt.com"
+            | "chat.openai.com"
+    ) {
+        // An unrecognized built-in/official path is not evidence of Sub2API.
+        return None;
+    }
+    let origin = url.origin();
+    let endpoint_path = if path.ends_with("/v1") {
+        format!("{path}/usage")
+    } else {
+        format!("{path}/v1/usage")
+    };
+    url.set_path(&endpoint_path);
+    if url.origin() != origin {
+        return None;
+    }
+    Some(BalanceTarget {
+        vendor: Vendor::Sub2Api,
+        endpoint: url,
+    })
 }
 
 fn environment_value(name: &str) -> std::result::Result<String, &'static str> {
@@ -121,6 +167,7 @@ fn environment_value(name: &str) -> std::result::Result<String, &'static str> {
 fn credential(
     provider: &SavedProvider,
     detected: bool,
+    allow_detected_legacy_key: bool,
 ) -> std::result::Result<String, &'static str> {
     let doc = provider
         .toml_config
@@ -141,7 +188,7 @@ fn credential(
             .get(id)?
             .as_table_like()
     });
-    // Only the official API's Bearer credential is relevant. Do not forward
+    // Only the balance API's Bearer credential is relevant. Do not forward
     // arbitrary provider headers (Host, cookies, routing headers, etc.).
     let mut custom_authorization = None;
     if let Some(table) = table {
@@ -196,6 +243,7 @@ fn credential(
     } else if let Some(key) = provider
         .api_key
         .as_deref()
+        .filter(|_| !detected || allow_detected_legacy_key)
         .filter(|key| !key.trim().is_empty())
     {
         key.to_string()
@@ -205,6 +253,9 @@ fn credential(
         .filter(|key| !key.trim().is_empty())
         .map(ToString::to_string)
         .or_else(|| {
+            if detected && !allow_detected_legacy_key {
+                return None;
+            }
             doc.as_ref()
                 .and_then(|doc| providers::experimental_bearer_token_from_doc(doc, None))
         })
@@ -251,9 +302,16 @@ fn cache() -> &'static Mutex<HashMap<String, Arc<CacheEntry>>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn cached_balance(vendor: Vendor, key: &str, force: bool, requested_at: Instant) -> BalanceValue {
+fn cached_balance(
+    target: &BalanceTarget,
+    key: &str,
+    force: bool,
+    requested_at: Instant,
+) -> BalanceValue {
     let mut digest = Sha256::new();
-    digest.update(vendor.endpoint().as_bytes());
+    digest.update(target.vendor.name().as_bytes());
+    digest.update([0]);
+    digest.update(target.endpoint.as_str().as_bytes());
     digest.update([0]);
     digest.update(key.as_bytes());
     let identity = format!("{:x}", digest.finalize());
@@ -295,16 +353,12 @@ fn cached_balance(vendor: Vendor, key: &str, force: bool, requested_at: Instant)
             return value.clone();
         }
     }
-    let value = request_balance(vendor, key).unwrap_or_else(BalanceValue::failure);
+    let value = request_balance(target, key).unwrap_or_else(BalanceValue::failure);
     *entry = Some((Instant::now(), value.clone()));
     value
 }
 
-fn json_request(
-    client: &Client,
-    url: &'static str,
-    key: &str,
-) -> std::result::Result<Value, &'static str> {
+fn json_request(client: &Client, url: &str, key: &str) -> std::result::Result<Value, &'static str> {
     let mut authorization =
         HeaderValue::from_str(&format!("Bearer {key}")).map_err(|_| "invalid_credential")?;
     authorization.set_sensitive(true);
@@ -356,20 +410,28 @@ fn amount(currency: &str, value: &Value) -> std::result::Result<BalanceAmount, &
     })
 }
 
-fn request_balance(vendor: Vendor, key: &str) -> std::result::Result<BalanceValue, &'static str> {
+fn request_balance(
+    target: &BalanceTarget,
+    key: &str,
+) -> std::result::Result<BalanceValue, &'static str> {
     crate::remote::ensure_crypto_provider();
-    // Same fresh-client system/ENV proxy behavior and five-second timeout as
-    // remote_client, with credentials additionally confined by no redirects.
+    // Same fresh-client system/ENV proxy behavior as remote_client. Sub2API
+    // retains its saved origin/scheme, including self-hosted HTTP endpoints.
+    // Redirects are disabled for every target, so credentials stay at that URL.
     let client = Client::builder()
-        .timeout(REQUEST_TIMEOUT)
+        .timeout(if target.vendor == Vendor::Sub2Api {
+            SUB2API_TIMEOUT
+        } else {
+            REQUEST_TIMEOUT
+        })
         .user_agent("Codex-X")
-        .https_only(true)
+        .https_only(target.endpoint.scheme() == "https")
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|_| "network_error")?;
-    let payload = json_request(&client, vendor.endpoint(), key)?;
+    let payload = json_request(&client, target.endpoint.as_str(), key)?;
     let mut kind = "balance";
-    let balances = match vendor {
+    let balances = match target.vendor {
         // https://api-docs.deepseek.com/api/get-user-balance
         Vendor::DeepSeek => {
             let infos = payload
@@ -451,6 +513,7 @@ fn request_balance(vendor: Vendor, key: &str) -> std::result::Result<BalanceValu
                     .ok_or("invalid_response")?,
             )?]
         }
+        Vendor::Sub2Api => sub2api_wallet(&payload)?,
     };
     Ok(BalanceValue {
         kind: Some(kind),
@@ -458,6 +521,49 @@ fn request_balance(vendor: Vendor, key: &str) -> std::result::Result<BalanceValu
         checked_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
         error: None,
     })
+}
+
+fn empty_usage_field(value: Option<&Value>) -> bool {
+    match value {
+        None | Some(Value::Null) => true,
+        Some(Value::Array(items)) => items.is_empty(),
+        _ => false,
+    }
+}
+
+fn sub2api_wallet(payload: &Value) -> std::result::Result<Vec<BalanceAmount>, &'static str> {
+    if payload.get("error").is_some_and(|value| !value.is_null())
+        || payload.get("isValid").and_then(Value::as_bool) != Some(true)
+    {
+        return Err("api_error");
+    }
+    if payload.get("mode").and_then(Value::as_str) != Some("unrestricted")
+        || ["quota", "subscription", "subscriptions"]
+            .iter()
+            .any(|field| payload.get(*field).is_some_and(|value| !value.is_null()))
+        || !empty_usage_field(payload.get("rate_limits"))
+    {
+        return Err("unsupported_usage");
+    }
+    // Zero is a valid wallet balance. Only an absent/null balance selects the
+    // compatibility remaining field; a malformed balance must not be hidden.
+    let value = payload
+        .get("balance")
+        .filter(|value| !value.is_null())
+        .or_else(|| payload.get("remaining"))
+        .ok_or("invalid_response")?;
+    let unit = match payload.get("unit") {
+        None | Some(Value::Null) => "",
+        Some(Value::String(unit))
+            if !unit.trim().is_empty()
+                && unit.chars().count() <= 32
+                && !unit.chars().any(char::is_control) =>
+        {
+            unit.trim()
+        }
+        _ => return Err("invalid_response"),
+    };
+    Ok(vec![amount(unit, value)?])
 }
 
 struct Decimal {
@@ -579,19 +685,26 @@ fn provider_result(
         checked_at: None,
         error_code: None,
     };
-    let Some(vendor) = vendor_for_provider(provider) else {
+    let Some(target) = target_for_provider(provider) else {
         return result;
     };
-    result.vendor = Some(vendor.name());
-    result.supported = true;
-    let key = match credential(provider, source == "detected") {
+    result.vendor = Some(target.vendor.name());
+    result.supported = target.vendor != Vendor::Sub2Api;
+    let key = match credential(
+        provider,
+        source == "detected",
+        target.vendor != Vendor::Sub2Api,
+    ) {
         Ok(key) => key,
         Err(code) => {
             result.error_code = Some(code);
             return result;
         }
     };
-    let value = cached_balance(vendor, &key, force, requested_at);
+    let value = cached_balance(&target, &key, force, requested_at);
+    if target.vendor == Vendor::Sub2Api {
+        result.supported = value.error.is_none() && !value.balances.is_empty();
+    }
     result.balance_kind = value.kind;
     result.balances = value.balances;
     result.checked_at = Some(value.checked_at);
@@ -782,7 +895,7 @@ impl BalanceMonitor {
             };
             // Re-enumerate current saved/native providers every round. A scope
             // change cancels queued old work between cards; active HTTP calls
-            // retain their existing bounded timeout and official-only URLs.
+            // retain their bounded timeout and locally resolved target URLs.
             let result = read_balances_at(&target.home, &|| self.is_current(target.generation));
             self.completed(target.generation, refresh_delay(&result), true);
         }
@@ -852,7 +965,7 @@ pub(crate) fn refresh_provider_balance_inner(
     .ok_or_else(|| {
         CodexxError::Config("该供应商已不存在或当前配置已改变，请刷新供应商列表。".into())
     })?;
-    if vendor_for_provider(&provider).is_none() {
+    if target_for_provider(&provider).is_none() {
         return Err(CodexxError::Config("该供应商不支持余额刷新。".into()));
     }
     // Deliberately leave the independent five-minute monitor deadline alone.

@@ -1,0 +1,10 @@
+{
+  "models": [
+    { "id": "gpt-6.1-sol", "displayName": "GPT-6.1 Sol", "isDefault": true },
+    { "id": "gpt-6-astra", "displayName": "GPT-6 Astra", "isDefault": false },
+    { "id": "gpt-6-luna", "displayName": "GPT-6 Luna", "isDefault": false }
+  ],
+  "recommendedModel": "gpt-6.1-sol",
+  "source": "bundled",
+  "warning": null
+}

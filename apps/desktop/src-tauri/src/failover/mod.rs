@@ -2,6 +2,7 @@ mod circuit_breaker;
 pub(crate) mod config;
 mod controller;
 pub(crate) mod native_official;
+mod native_stream;
 pub(crate) mod protocol;
 mod proxy;
 

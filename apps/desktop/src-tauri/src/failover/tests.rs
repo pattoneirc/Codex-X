@@ -181,7 +181,7 @@ fn enabling_auto_switches_to_p1_even_if_current_is_elsewhere() {
 }
 
 #[test]
-fn a_single_provider_queue_and_an_empty_running_queue_are_valid() {
+fn a_single_provider_queue_is_valid_and_saving_an_empty_active_queue_is_rejected() {
     let _guard = crate::app_db::test_db_guard();
     let fixture = Fixture::new();
     let mut settings = fixture.settings();
@@ -194,9 +194,10 @@ fn a_single_provider_queue_and_an_empty_running_queue_are_valid() {
     assert!(single.auto_failover_active);
     let mut settings = single.settings;
     settings.provider_ids.clear();
-    let empty = save_settings(fixture.scope(), settings).unwrap();
-    assert!(empty.running && empty.auto_failover_active);
-    assert!(empty.runtime.providers.is_empty());
+    assert!(save_settings(fixture.scope(), settings).is_err());
+    let unchanged = get_status(fixture.scope()).unwrap();
+    assert!(unchanged.running && unchanged.auto_failover_active);
+    assert_eq!(unchanged.runtime.providers.len(), 1);
 }
 
 #[test]
@@ -804,6 +805,7 @@ fn failover_to_converted_provider_preserves_close_guard() {
         instance_id: runtime.instance_id,
         token: runtime.token.clone(),
         event: ProxySelectionEvent {
+            model: None,
             provider_id: fixture.providers[1].id.clone(),
             revision: runtime.proxy.revision(),
         },
@@ -1064,6 +1066,7 @@ fn successful_fallback_updates_logical_provider_and_preserves_old_backup_identit
         instance_id: runtime.instance_id,
         token: runtime.token.clone(),
         event: ProxySelectionEvent {
+            model: Some("different-default".into()),
             provider_id: fixture.providers[1].id.clone(),
             revision: runtime.proxy.revision(),
         },
@@ -1072,7 +1075,10 @@ fn successful_fallback_updates_logical_provider_and_preserves_old_backup_identit
     drop(runtimes);
     let selected = get_status(fixture.scope()).unwrap();
     assert_eq!(selected.primary.unwrap().id, fixture.providers[1].id);
-    assert_eq!(parsed(&fixture)["model"].as_str(), Some("same-model"));
+    assert_eq!(
+        parsed(&fixture)["model"].as_str(),
+        Some("different-default")
+    );
     let direct = direct_document(&fixture.dir, &parsed(&fixture)).unwrap();
     assert_eq!(
         direct["model_providers"]["custom"]["name"].as_str(),
@@ -1108,6 +1114,7 @@ fn late_success_cannot_override_a_manual_switch_or_a_changed_queue() {
             instance_id: runtime.instance_id,
             token: runtime.token.clone(),
             event: ProxySelectionEvent {
+                model: None,
                 provider_id: fixture.providers[1].id.clone(),
                 revision: runtime.proxy.revision(),
             },
@@ -1140,6 +1147,7 @@ fn a_late_success_from_a_stopped_listener_cannot_change_the_restarted_route() {
             instance_id: runtime.instance_id,
             token: runtime.token.clone(),
             event: ProxySelectionEvent {
+                model: None,
                 provider_id: fixture.providers[1].id.clone(),
                 revision: runtime.proxy.revision(),
             },

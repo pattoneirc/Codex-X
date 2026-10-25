@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-const APP_DB_SCHEMA_VERSION: i64 = 9;
+const APP_DB_SCHEMA_VERSION: i64 = 10;
 
 struct DatabaseInitializer {
     migration_lock: Mutex<()>,
@@ -226,6 +226,11 @@ fn initialize_schema(conn: &Connection) -> Result<()> {
             PRIMARY KEY(codex_dir, id)
         );
         CREATE TABLE IF NOT EXISTS official_profile_selections (
+            codex_dir TEXT PRIMARY KEY,
+            profile_id TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS official_profile_defaults (
             codex_dir TEXT PRIMARY KEY,
             profile_id TEXT NOT NULL,
             updated_at TEXT NOT NULL
@@ -570,7 +575,7 @@ mod tests {
 
         let initializer = DatabaseInitializer::new();
         let migrated = initializer.open_at(&path).unwrap();
-        assert_eq!(schema_version(&migrated).unwrap(), 9);
+        assert_eq!(schema_version(&migrated).unwrap(), APP_DB_SCHEMA_VERSION);
         assert!(table_column_set(&migrated, "providers")
             .unwrap()
             .contains("upstream_api"));
@@ -600,7 +605,7 @@ mod tests {
         drop(migrated);
 
         let reopened = DatabaseInitializer::new().open_at(&path).unwrap();
-        assert_eq!(schema_version(&reopened).unwrap(), 9);
+        assert_eq!(schema_version(&reopened).unwrap(), APP_DB_SCHEMA_VERSION);
         assert_eq!(
             snapshot(&reopened),
             before,

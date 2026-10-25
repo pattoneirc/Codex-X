@@ -8,6 +8,7 @@ import {
 import type { LucideIcon } from "lucide-react";
 import type { UsageDay, UsageModel, UsageRange, UsageStatistics } from "../usageTypes";
 import { initialUsageLoadState, sameUsageQuery, usageLoadReducer } from "../usageStatisticsState";
+import { Select } from "../components/ui";
 import "../styles/usage-statistics.css";
 
 type Language = "zh" | "en";
@@ -281,6 +282,10 @@ export function UsageStatisticsPage({ lang, configDir, active = true }: UsageSta
     const available = record?.data.availableModels ?? [];
     return Array.from(new Set([...available, ...(model ? [model] : [])])).sort();
   }, [record, configDir, model]);
+  const modelFilterOptions = useMemo(() => [
+    { value: "", label: copy.allModels },
+    ...modelOptions.map((value) => ({ value, label: modelLabel(value, lang) })),
+  ], [copy.allModels, lang, modelOptions]);
   const partial = data && (data.coverage.skippedFiles > 0 || data.coverage.truncated || data.coverage.warnings.length > 0);
   const hasUsage = data && data.totals.totalTokens > 0;
   const cacheRate = data ? ratio(data.totals.cachedInputTokens, data.totals.inputTokens) : 0;
@@ -291,7 +296,7 @@ export function UsageStatisticsPage({ lang, configDir, active = true }: UsageSta
       <div className="cx-usage-range" role="group" aria-label={copy.range}>
         {(Object.keys(copy.ranges) as UsageRange[]).map((value) => <button key={value} type="button" aria-pressed={range === value} className={range === value ? "cx-usage-range-active" : ""} onClick={() => setRange(value)}>{copy.ranges[value]}</button>)}
       </div>
-      <div className="cx-usage-toolbar-actions"><label className="cx-usage-model-select"><span className="cx-usage-sr-only">{copy.model}</span><select value={model} onChange={(event) => setModel(event.currentTarget.value)} aria-label={copy.model}><option value="">{copy.allModels}</option>{modelOptions.map((value) => <option key={value} value={value}>{modelLabel(value, lang)}</option>)}</select></label>
+      <div className="cx-usage-toolbar-actions"><Select className="cx-usage-model-select" size="md" value={model} onValueChange={setModel} options={modelFilterOptions} aria-label={copy.model} />
         <button type="button" className="cx-page-button cx-page-button--secondary cx-usage-refresh" disabled={busy} onClick={() => void load(true)}><RefreshCw size={14} className={busy ? "cx-page-spin" : ""} aria-hidden="true" />{busy ? copy.refreshing : copy.refresh}</button>
       </div>
       <div className="cx-usage-query-status" role="status" aria-live="polite" aria-atomic="true">
