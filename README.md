@@ -118,7 +118,7 @@
   </tr>
   <tr>
     <td align="center"><b>跨平台使用</b></td>
-    <td align="left">提供 macOS Apple Silicon / Intel、Windows EXE / 便携版和 Linux 安装包；安装版可在应用内直接下载、校验并安装更新，便携版继续使用手动下载。</td>
+    <td align="left">提供 macOS Apple Silicon / Intel、Windows MSI / 便携版和 Linux 安装包；MSI 安装版可在应用内直接下载、校验并安装更新，便携版继续使用手动下载。</td>
   </tr>
 </table>
 </div>
@@ -245,6 +245,8 @@ Codex-X 现在不只是“几套内置 Prompt”的启动器，而是一个可�
 
 ### 3. 会话管理：同步、检查与永久删除
 
+会话列表优先显示已设置的名称，悬停可看首次提示词。Windows 支持只读查看和导出 WSL 会话，使用条件和限制见 [WSL 会话说明](docs/WSL_SESSIONS.md)。
+
 <table>
   <tr>
     <td width="50%" valign="top">
@@ -336,11 +338,13 @@ Codex-X 现在不只是“几套内置 Prompt”的启动器，而是一个可�
 
 - macOS Apple Silicon `.dmg`
 - macOS Intel `.dmg`
-- Windows `.exe`（安装到当前用户，后续更新无需管理员权限）
+- Windows `.msi`（推荐安装包，支持应用内在线更新）
 - Windows Portable `.zip`
 - Linux `.deb` / `.rpm` / `.AppImage`
 - GitHub Releases 自动构建发布
 - 安装版支持应用内自动更新，Windows 便携版保留手动更新
+
+Windows 安装包统一为 MSI。已安装 EXE 的用户需手动换装一次：先退出 Codex-X，在 Windows 设置中卸载 EXE 版，并保留应用数据（不要勾选删除数据），再安装 MSI。换装后继续使用软件内在线更新。
 
 ## 技术栈
 

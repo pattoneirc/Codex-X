@@ -8,6 +8,54 @@
 
 日志不得包含 Token、认证文件内容、用户数据或仅适用于某台电脑的隐私路径。
 
+## 2026-11-09：Windows 重启路径竞态与 macOS 启动恢复
+
+- 用户报告 Windows 客户端已经被关闭，随后因 CIM 进程路径不可读报错而没有重开。确认旧 StopDesktop 关闭后反复全局扫描同名进程，退出中的空路径记录会抛错；普通独立版的启动确认异常还会主动终止刚启动的进程。
+- Windows 改用当前会话筛选及原生低权限路径/创建时间回查，排除已退出和复用 PID；停止前验证全部选定进程的路径、同用户同会话身份并绑定句柄，关闭后只等这些句柄。启动确认只请求查询权限，普通启动不因短暂观测失败而被杀掉；调试端口操作保留原严格身份与清理要求。
+- 区分关闭/激活尚未尝试、已经尝试和 runner 超时未知阶段。失败后先重新观测，确认没有存活的选定进程才最多恢复一次；管理员 Store 恢复仍经验证过的普通权限桌面。审阅补齐原本无进程时激活失败的恢复分支，不把它误称为准备失败；结构化错误和 stderr 统一处理，不把 PowerShell 堆栈作为主提示。
+- macOS 在原超时内继续确认暂时读取失败的进程状态，不把读取异常当成退出。首次系统启动回执成功但未出现主进程时，用不带 `-n` 的 LaunchServices 激活恢复一次；状态不明确或已有进程时不重复启动。保留选定 CODEX_HOME、环境隔离和一次性中文设置，不新增常驻注入。
+- 本机纯 Rust 恢复测试 9 项、macOS 针对性测试 8 项通过。使用自有临时 App 的 LaunchServices 实测 1 项通过：启动器退出后仍独立存活、父进程/进程组隔离、中文空格配置路径及环境传递、正常结束后再次启动。已清理测试进程、目录和仅该测试 bundle 的注册，没有停止真实 Codex/ChatGPT 或改动真实会话。
+- [Windows 快验 42599293141](https://github.com/yynxxxxx/Codex-X/actions/runs/42599293141) 在 Windows PowerShell 5.1 和 PowerShell 7 均通过每轮 10 项检查，直接执行同源生产 helpers/fixtures；真实原生 API 只查询测试 PowerShell 自身。包含空 CIM 路径、已退出/其他会话/复用 PID、先绑定再关闭、关闭后不全局重扫，以及 Store 预检/激活阶段。实际用户 Store 客户端未在本轮重启；不据此声称所有现场问题均已实机复现。
+- v0.3.33 沿用只发布 MSI 的 Windows 规则；正式全平台打包与 MSI 安装检查仍由 Release 流水线执行。
+- [v0.3.33 正式 Release 42599733888](https://github.com/yynxxxxx/Codex-X/actions/runs/42599733888) 首次运行全部通过并公开发布：Windows 832 项原生测试、195 项前端测试通过，1 项手动基准忽略、2 项依赖本机 SDK 的前端检查跳过；MSI 正常/重复安装、历史 MSI 升级、窗口启动、自动重开和配置保留检查通过。两架构 macOS 签名、公证票据及 DMG 检查和 Linux 构建通过。
+- 发布后匿名固定版本/latest 清单均为 0.3.33，11 个平台键完整，所有 Windows 键指向同一 MSI 与签名，公开资产无 EXE 安装包。实际 MSI 大小和 GitHub SHA256 一致，使用配置中的更新公钥通过文件签名及 trusted-comment 签名复核；发布说明为本版重启变化和具体安装步骤。
+
+## 2026-11-09：按维护者最终要求统一 Windows MSI 发布
+
+- 维护者明确要求移除当前 v0.3.32 的 EXE 安装包，所有 Windows 安装更新项均指向 MSI。这一最新指令取代此前“保留 EXE 兼容发布”的约定；根 AGENTS.md、Windows 发布约定、README 和后续打包工作流同步改为仅 MSI。
+- 本次只修正 v0.3.32 的资产、说明及更新清单，MSI 原始文件和签名保持不变，不移动已发布标签。旧 EXE 安装需一次手动卸载并保留应用数据、安装 MSI；不宣称旧版 EXE 能靠清单变更自动跨格式安装。
+- 清单校验要求三个 Windows 键使用同一 MSI/签名，并拒绝任何 EXE/EXE.sig 安装资产；11 项针对性测试通过。正式及候选工作流仅构建 MSI，Windows 平台默认配置也限定 MSI，保留实际 MSI 安装升级检查。
+- 按维护者要求重写面向用户的发布说明，列出本版功能、旧 EXE 换装步骤，以及 Windows 安全中心中关闭智能应用控制的具体路径；说明关闭的是该项系统防护。路径按微软官方支持文档核对，未操作用户电脑安全设置，不把用户自行调整设置说成发布者签名已经解决。
+- v0.3.32 的公开 EXE 已移除，三个 Windows 更新项已核对统一 MSI，原 MSI 资产 ID、摘要和签名未变；[独立发布复核 42595283360](https://github.com/yynxxxxx/Codex-X/actions/runs/42595283360) 使用当前 MSI-only 校验规则通过。v0.3.33 已按此规则从源头仅构建 MSI。
+
+## 2026-11-09：撤回 v0.3.31，恢复 MSI 与在线更新
+
+- 按维护者要求将 v0.3.31 Release 撤为草稿，保留原标签和提交。基于远端 `ce611be` 制作 v0.3.32；不替换同版本的已发布二进制，确保已装 0.3.31 的客户端能检测到更高版本。
+- 复核确认旧 Windows 暂存器只接受 PE/EXE，而 Tauri 根据安装时写入的包类型优先选择 `windows-x86_64-nsis` / `windows-x86_64-msi`。恢复 MSI 默认包时必须同时增加 MSI 安装支持，并保留旧 EXE 客户端的独立更新入口；不能把三个入口统一改成 MSI 后声称旧版可在线安装。
+- Windows 默认及 MSI 更新项恢复 MSI，NSIS 更新项只向已有 EXE 安装提供兼容包。下载、Tauri 公钥验签、主下载失败后的官方 API 恢复和路由退出保护继续保留。MSI 和 NSIS 分别执行 Windows 安装验证。
+- 维护者确认拦截提示来自 Smart App Control。现有日志已记录 Code Integrity 3077，项目尚无 Windows 发布者签名证书或服务配置。MSI 恢复不等同解除该策略对程序的拦截；不修改用户系统安全策略，不把 CI 正常启动或 Tauri 验签等同 SAC 放行。
+- 发布后下载检查复用已有完整文件下载、大小和 GitHub SHA256 校验，并记录公开入口或官方 API 回退结果，替代曾触发 504 的 Range 探测；最终验证结果见下方。
+- 本地 4 项 Windows 暂存/参数 Rust 测试、11 项更新清单回归通过。WiX fragment 通过上游 v3 XSD 检查，Tauri 检查确认 UpgradeCode 与历史 MSI 一致；新增安装检查在临时 Windows runner 上执行真实安装、窗口启动、旧 MSI 升级和配置哨兵检查，本机未执行 Windows 安装。
+- 首轮正式构建的四平台打包完成、Windows 811 项 Rust 回归及 NSIS 检查通过，但新增 MSI 脚本在身份读取处失败，发布被阻止。原包中的 UpgradeCode 正确；改用原生 Windows Installer 只读 API 后，发现脚本还错误地把 WM_QUIT 当作 Tauri 退出接口，已改为明确模拟已追踪测试进程退出，不涉及产品退出代码或系统安装服务。
+- [MSI 独立快验 42590088559](https://github.com/yynxxxxx/Codex-X/actions/runs/42590088559) 全部通过：四种 EXE 登记冲突、清洁和重复安装、实际窗口启动、真实 v0.3.20 MSI 升级到 v0.3.32 后自动重开、唯一产品登记和配置哨兵。此测试不验证实际 app.exit 回调或 SAC 信任。详细发布约束及本次脚本问题已归档至 `WINDOWS_RELEASE_GUIDE.md`，由根 AGENTS.md 引用。
+- [正式 Release 42590421251](https://github.com/yynxxxxx/Codex-X/actions/runs/42590421251) 最终全部成功并发布 v0.3.32，v0.3.31 继续保持撤回草稿。Windows 811 项原生回归、195 项前端回归、MSI/NSIS 安装升级与配置保留通过；另有 1 项手动基准忽略、2 项依赖本机 SDK 的前端检查跳过。
+- Intel 首次公证为 Accepted，但实际归档缺少票据，发布门槛正确阻止了上线。核对 Tauri CLI 2.11.4 上游 `tauri-macos-sign::staple_app` 发现其忽略 stapler 的失败退出码；仅重跑失败的 Intel job 后，签名、系统评估、票据和 DMG 检查通过，没有跳过门槛。此前手动附票的本地临时副本不作为原发布归档合格证据。
+- 公开固定版本与 latest 更新清单均为 0.3.32，11 个平台项完整。正式 MSI 与旧 EXE 兼容包的实际文件大小、GitHub SHA256、Tauri 文件签名及 trusted-comment 签名分别核验通过；默认/MSI 项指向 MSI，NSIS 项保持 EXE。上述验签不是 Windows 发布者签名，SAC 拦截仍不应标记为已解决。
+
+## 2026-11-09：v0.3.31 发布与验证（后按维护者要求撤回）
+
+- Issue #71 的 `client_metadata` 已在 `489ba67` 修复并包含于 v0.3.30。保留现有三种转换协议剥离该字段、原生 Responses 保留原字节的回归，本次不重复改动该逻辑。
+- Issue #77 已用正式 v0.3.30 原生程序和独立配置/管理数据库复现。手动 TOML 编辑选择 `env_key` 时，保存命令清除表单携带的旧密钥及内嵌 Bearer；普通 API Key 表单编辑保留原有优先级，混合编辑按最后一次鉴权编辑处理。热保存、切换往返、非活动配置及非法变量名称均有回归；连通性和模型请求从运行环境解析变量，不落库。
+- Issue #72 的普通 Store 重启允许通过同用户、同会话、非提升且中完整性的 Explorer 桌面委托激活；预检先于停止客户端，目标安装身份、进程路径和创建时间继续校验。自定义 CODEX_HOME 和需要调试端口的操作保留原限制。三个隔离 PowerShell 流程测试及真实桌面的只读 broker 预检已通过；没有中断用户正在使用的 Codex 做真实管理员重启。
+- Issue #76 区分会话名称与首次消息，读取线程显式名称、CLI 名称索引及桌面目录名称，不改源标题。WSL 会话使用指定发行版中的 Python SQLite 只读连接及 backup API 取得含已提交 WAL 的一致性快照；Windows 仅读临时快照。维护锁和删除/同步入口禁止 WSL 写入，界面显示只读并保留导出。宿主未配置 WSL 发行版，原生 helper 使用合成活动 WAL fixture 验证，不能将其视为真实 WSL 实机验证。
+- 本地类型检查、前端回归与 renderer 构建通过；WSL helper 的 6 项回归和更新清单校验器的 8 项回归通过。清单校验测试改用当前 Python 解释器，修复 Windows 没有 `python3` 命令时无法运行的问题。
+- [Windows 候选验证](https://github.com/yynxxxxx/Codex-X/actions/runs/42569286121) 全部成功：810 项 Rust 通过、1 项手动基准忽略；195 项 Node 通过、2 项依赖已安装 SDK 的测试跳过；WSL helper 6 项通过。干净用户安装和覆盖更新、真实 v0.3.20 系统 MSI 迁移及后续更新、卸载返回 3010 后无需重启继续更新三组验收通过，配置哨兵保持不变；同时验证旧目录、子目录及 junction 重叠安装会被拒绝。
+- 本机 Edge 中的实际前端交互 6/6 通过，覆盖活动与非活动供应商的三种 TOML/API Key 编辑顺序及其他配置保留。候选原生程序已从该运行下载，但 Windows Code Integrity 事件 3077（Smart App Control 的 VerifiedAndReputableDesktop 策略）拒绝启动未进行 Windows 发布者签名的新程序；因此本机原生保存、切换、网络鉴权和名称显示脚本尚未执行，不能写为本机验收通过。未修改系统安全策略，现有安装仅做程序文件备份，未被候选替换。
+- 候选流水线保留 release 程序和安装包，便于本地隔离验收。NSIS 工具下载加入有限重试；历史 MSI 下载遇 504 时可回退 GitHub 资产 API，继续核验原固定 SHA256。
+- [v0.3.31 已公开发布](https://github.com/yynxxxxx/Codex-X/releases/tag/v0.3.31)。[正式四平台构建](https://github.com/yynxxxxx/Codex-X/actions/runs/42570814184) 的 Linux、两种 macOS 和 Windows job 全部成功；两种 macOS 另行通过签名、公证及 DMG 校验，Windows 实际安装、旧 MSI 迁移和便携包生成通过。公开资产共 10 项，更新清单包含 11 个平台条目。
+- 原发布 job 在公开后的最后一次 Range 下载探测遇到 504，因此该运行整体保留失败记录；不能将其写成整个原流水线成功。本机复现三个标准地址的 Range GET 504，而同六个资产的官方 API Range 均可读。新增[独立只读复核](https://github.com/yynxxxxx/Codex-X/actions/runs/42573048654)，实际完整下载并核对所有文件大小和 GitHub SHA256，结果成功：六个安装包均从标准公开地址获取并校验通过，`latest.json` 使用官方 API 回退，未重写任何已发布资产。
+- 正式 Windows 安装包实际下载后，SHA256 与 GitHub digest 一致，并使用 tag 中的公钥通过 Ed25519/BLAKE2b 文件签名和 trusted-comment 签名核验，公钥 ID 为 `6BA0DBDE56BB0A5E`。这是 Tauri 更新签名，不是 Windows Authenticode 发布者签名。正式便携程序在本机同样因 Smart App Control 被拒绝启动；本机仍保留 v0.3.30，程序文件与已验证的旧版备份一致，未声称完成本机原生升级验收。
+
 ## 2026-10-09：在线更新主通道故障后的自动恢复
 
 - 用户确认 Windows EXE 安装版 0.3.21 能发现新版，但只提供下载页。代码核对显示原生检查失败后仍从版本元数据服务发现新版，却把安装版更新方式静默改为 download。0.3.21 / 0.3.24 的更新模块无代码差异；公开清单平台、URL、公钥和安装包签名核验通过，Git 邮箱改写没有改变发行资产。用户机器的首通道失败原因未在现场复现，不能只凭提示判断网络、代理或便携标识。

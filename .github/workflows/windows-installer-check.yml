@@ -5,6 +5,12 @@ on:
     branches:
       - 'codex/windows-updater-*'
   workflow_dispatch:
+    inputs:
+      restart_only:
+        description: Run isolated Windows restart checks without rebuilding installers
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -14,8 +20,25 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  restart-fixtures:
+    name: Verify isolated desktop restart behavior
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - name: Check production Windows PowerShell helpers
+        shell: powershell
+        run: ./scripts/test_windows_desktop_restart.ps1
+      - name: Check PowerShell 7 compatibility
+        shell: pwsh
+        run: ./scripts/test_windows_desktop_restart.ps1
+
   windows-installer:
     name: Verify Windows update migration
+    needs: restart-fixtures
+    if: ${{ !inputs.restart_only }}
     runs-on: windows-latest
     timeout-minutes: 45
     defaults:
@@ -40,6 +63,8 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm --dir apps/desktop typecheck
       - run: node --test apps/desktop/tests/*.test.mjs
+      - name: Test native WSL SQLite snapshots with active WAL fixtures
+        run: python scripts/test_wsl_session_snapshot.py
       - name: Verify SDK TLS fixture tooling
         run: |
           $openssl = Get-Command openssl -ErrorAction Stop
@@ -72,9 +97,28 @@ jobs:
       - name: Build test installer without publishing or release signing credentials
         run: |
           Set-Content -Path "$env:RUNNER_TEMP\installer-check.json" -Value '{"bundle":{"createUpdaterArtifacts":false}}' -Encoding utf8
-          pnpm --dir apps/desktop tauri build --debug --bundles nsis --config "$env:RUNNER_TEMP\installer-check.json" --ci
-      - name: Test real MSI migration and subsequent updates
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            pnpm --dir apps/desktop tauri build --bundles msi --config "$env:RUNNER_TEMP\installer-check.json" --ci
+            $buildExitCode = $LASTEXITCODE
+            if ($buildExitCode -eq 0) { break }
+            if ($attempt -lt 3) { Start-Sleep -Seconds 5 }
+          }
+          if ($buildExitCode -ne 0) { exit $buildExitCode }
+      - name: Retain Windows candidate for local validation
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-candidate
+          path: |
+            apps/desktop/src-tauri/target/release/bundle/msi/*.msi
+            apps/desktop/src-tauri/target/release/codex-x.exe
+            THIRD_PARTY_NOTICES.md
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Test MSI installation, upgrade, and application launch
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          $installers = @(Get-ChildItem apps/desktop/src-tauri/target/debug/bundle/nsis -Filter '*.exe')
-          if ($installers.Count -ne 1) { throw 'Expected one Windows installer.' }
-          ./scripts/windows-install-smoke.ps1 -Installer $installers[0].FullName
+          $installers = @(Get-ChildItem apps/desktop/src-tauri/target/release/bundle/msi -Filter '*.msi')
+          if ($installers.Count -ne 1) { throw 'Expected one MSI installer.' }
+          ./scripts/windows-msi-install-smoke.ps1 -Installer $installers[0].FullName

@@ -3,6 +3,7 @@
 import base64
 import json
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -18,9 +19,9 @@ PLATFORM_ASSETS = {
     "darwin-aarch64-app": "Codex-X.app.tar.gz",
     "darwin-x86_64": "Codex-X-intel.app.tar.gz",
     "darwin-x86_64-app": "Codex-X-intel.app.tar.gz",
-    "windows-x86_64": "Codex-X.exe",
-    "windows-x86_64-nsis": "Codex-X.exe",
-    "windows-x86_64-msi": "Codex-X.exe",
+    "windows-x86_64": "Codex-X.msi",
+    "windows-x86_64-nsis": "Codex-X.msi",
+    "windows-x86_64-msi": "Codex-X.msi",
     "linux-x86_64": "Codex-X.AppImage",
     "linux-x86_64-deb": "Codex-X.deb",
     "linux-x86_64-rpm": "Codex-X.rpm",
@@ -76,7 +77,7 @@ class ValidateUpdaterReleaseTests(unittest.TestCase):
     def run_validator(self, *extra_args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [
-                "python3",
+                sys.executable,
                 str(VALIDATOR),
                 "--manifest",
                 str(self.manifest_path),
@@ -132,59 +133,84 @@ class ValidateUpdaterReleaseTests(unittest.TestCase):
             )
         )
 
-    def test_migration_adds_legacy_msi_key_without_changing_other_platforms(self) -> None:
+    def test_restores_all_windows_targets_without_changing_other_platforms(self) -> None:
         manifest = json.loads(self.manifest_path.read_text())
-        del manifest["platforms"]["windows-x86_64-msi"]
+        for key in ("windows-x86_64", "windows-x86_64-nsis"):
+            manifest["platforms"][key]["url"] = draft_url("withdrawn-installer.exe")
+            manifest["platforms"][key]["signature"] = base64.b64encode(b"e" * 64).decode()
         original = manifest["platforms"]
         self.manifest_path.write_text(json.dumps(manifest))
-        result = self.run_validator("--rewrite-download-urls", "--migrate-windows-to-nsis")
+        result = self.run_validator("--rewrite-download-urls", "--restore-windows-msi")
         self.assertEqual(result.returncode, 0, result.stderr)
         actual = json.loads(self.manifest_path.read_text())["platforms"]
+        self.assertEqual(actual["windows-x86_64"], actual["windows-x86_64-msi"])
         self.assertEqual(actual["windows-x86_64-msi"], actual["windows-x86_64-nsis"])
-        self.assertEqual(actual["windows-x86_64"], actual["windows-x86_64-nsis"])
         for key, value in original.items():
             if not key.startswith("windows-"):
                 self.assertEqual(actual[key]["signature"], value["signature"])
                 self.assertEqual(actual[key]["url"].rsplit("/", 1)[1], value["url"].rsplit("/", 1)[1])
 
-    def test_migration_requires_an_actual_nsis_source_entry(self) -> None:
+    def test_restoration_requires_an_actual_msi_source_entry(self) -> None:
+        manifest = json.loads(self.manifest_path.read_text())
+        del manifest["platforms"]["windows-x86_64-msi"]
+        self.manifest_path.write_text(json.dumps(manifest))
+        result = self.run_validator("--rewrite-download-urls", "--restore-windows-msi")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing signed MSI", result.stderr)
+
+    def test_restoration_adds_missing_windows_aliases_from_msi_source(self) -> None:
         manifest = json.loads(self.manifest_path.read_text())
         del manifest["platforms"]["windows-x86_64-nsis"]
+        del manifest["platforms"]["windows-x86_64"]
         self.manifest_path.write_text(json.dumps(manifest))
-        result = self.run_validator("--rewrite-download-urls", "--migrate-windows-to-nsis")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("missing signed NSIS", result.stderr)
+        result = self.run_validator("--rewrite-download-urls", "--restore-windows-msi")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        actual = json.loads(self.manifest_path.read_text())["platforms"]
+        self.assertEqual(actual["windows-x86_64-msi"], actual["windows-x86_64-nsis"])
+        self.assertEqual(actual["windows-x86_64-msi"], actual["windows-x86_64"])
 
-    def test_rejects_windows_signature_divergence(self) -> None:
+    def test_rejects_msi_signature_divergence(self) -> None:
         manifest = json.loads(self.manifest_path.read_text())
-        manifest["platforms"]["windows-x86_64-msi"]["signature"] = base64.b64encode(b"x" * 64).decode()
+        manifest["platforms"]["windows-x86_64"]["signature"] = base64.b64encode(b"x" * 64).decode()
         self.manifest_path.write_text(json.dumps(manifest))
         result = self.run_validator("--rewrite-download-urls")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("same signed NSIS installer", result.stderr)
+        self.assertIn("same signed MSI installer", result.stderr)
 
-    def test_rejects_mixed_msi_release_assets(self) -> None:
-        assets = json.loads(self.assets_path.read_text())
-        assets.append({"name": "legacy.msi", "browser_download_url": draft_url("legacy.msi")})
-        self.assets_path.write_text(json.dumps(assets))
+    def test_rejects_divergent_signature_on_historical_nsis_target(self) -> None:
+        manifest = json.loads(self.manifest_path.read_text())
+        manifest["platforms"]["windows-x86_64-nsis"]["signature"] = base64.b64encode(b"n" * 64).decode()
+        self.manifest_path.write_text(json.dumps(manifest))
         result = self.run_validator("--rewrite-download-urls")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("must not be mixed", result.stderr)
+        self.assertIn("all Windows updater keys must use the same signed MSI", result.stderr)
 
-    def test_rejects_msi_payload_even_when_nsis_key_exists(self) -> None:
+    def test_rejects_unreferenced_exe_assets_and_signature_assets(self) -> None:
+        original_assets = json.loads(self.assets_path.read_text())
+        for name in ("Codex-X.exe", "Codex-X.exe.sig", "CODEX-X.EXE", "CODEX-X.EXE.SIG"):
+            with self.subTest(name=name):
+                self.assets_path.write_text(json.dumps([*original_assets, {"name": name}]))
+                result = self.run_validator("--rewrite-download-urls", "--restore-windows-msi")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("EXE installer assets are forbidden", result.stderr)
+
+    def test_historical_nsis_target_requires_msi_even_if_other_asset_exists(self) -> None:
         manifest = json.loads(self.manifest_path.read_text())
-        assets = json.loads(self.assets_path.read_text())
-        for item in manifest["platforms"].values():
-            item["url"] = item["url"].replace("Codex-X.exe", "Codex-X.msi")
-        for item in assets:
-            if item["name"] == "Codex-X.exe":
-                item["name"] = "Codex-X.msi"
-                item["browser_download_url"] = draft_url("Codex-X.msi")
+        manifest["platforms"]["windows-x86_64-nsis"]["url"] = draft_url("Codex-X.deb")
         self.manifest_path.write_text(json.dumps(manifest))
-        self.assets_path.write_text(json.dumps(assets))
-        result = self.run_validator("--rewrite-download-urls", "--migrate-windows-to-nsis")
+        result = self.run_validator("--rewrite-download-urls")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("expected a .exe updater", result.stderr)
+        self.assertIn("expected a .msi updater", result.stderr)
+
+    def test_requires_msi_and_other_platform_signature_assets_before_publishing(self) -> None:
+        result = self.run_validator("--rewrite-download-urls", "--require-signature-assets")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("signature asset is missing", result.stderr)
+        assets = json.loads(self.assets_path.read_text())
+        assets.extend({"name": name + ".sig"} for name in set(PLATFORM_ASSETS.values()))
+        self.assets_path.write_text(json.dumps(assets))
+        result = self.run_validator("--require-signature-assets")
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 if __name__ == "__main__":

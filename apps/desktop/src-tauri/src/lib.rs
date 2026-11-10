@@ -734,7 +734,10 @@ async fn restart_codex_desktop(
         sessions::with_session_maintenance(&codex_dir, || {
             codex_language::restart_client(config_dir)
         })
-        .map_err(|e| e.to_string())
+        .map_err(|error| match error {
+            CodexxError::Config(message) => format!("重启 Codex/ChatGPT 未完成：{message}"),
+            other => other.to_string(),
+        })
     })
     .await
     .map_err(|error| format!("重启 Codex 桌面客户端失败: {error}"))??;
@@ -1134,10 +1137,17 @@ fn save_provider_command_inner(provider: SavedProvider) -> Result<SavedProvider>
 }
 
 #[tauri::command]
-async fn save_provider(provider: SavedProvider) -> Result<SavedProvider> {
-    tauri::async_runtime::spawn_blocking(move || save_provider_command_inner(provider))
-        .await
-        .map_err(|e| CodexxError::Config(format!("保存供应商失败: {e}")))?
+async fn save_provider(
+    provider: SavedProvider,
+    prefer_toml_auth: Option<bool>,
+) -> Result<SavedProvider> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let provider =
+            providers::provider_with_editor_auth(provider, prefer_toml_auth.unwrap_or(false))?;
+        save_provider_command_inner(provider)
+    })
+    .await
+    .map_err(|e| CodexxError::Config(format!("保存供应商失败: {e}")))?
 }
 
 #[tauri::command]
@@ -1231,8 +1241,11 @@ async fn save_active_provider(
     provider: SavedProvider,
     config_dir: Option<String>,
     apply_common_config: Option<bool>,
+    prefer_toml_auth: Option<bool>,
 ) -> Result<ActionResult> {
     tauri::async_runtime::spawn_blocking(move || {
+        let provider =
+            providers::provider_with_editor_auth(provider, prefer_toml_auth.unwrap_or(false))?;
         let provider =
             providers::normalize_saved_provider_for_save(&providers::open_store()?, provider)?;
         failover::ensure_conversion_route(config_dir.clone(), &provider)?;

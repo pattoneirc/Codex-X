@@ -17,29 +17,33 @@ REQUIRED_PLATFORMS = {
     "darwin-aarch64-app": ".app.tar.gz",
     "darwin-x86_64": ".app.tar.gz",
     "darwin-x86_64-app": ".app.tar.gz",
-    "windows-x86_64": ".exe",
-    "windows-x86_64-nsis": ".exe",
-    # Older MSI clients select this key, then identify EXE/MSI by file content.
-    "windows-x86_64-msi": ".exe",
+    "windows-x86_64": ".msi",
+    # Keep the historical target name, but publish only MSI installers.
+    "windows-x86_64-nsis": ".msi",
+    "windows-x86_64-msi": ".msi",
     "linux-x86_64": ".AppImage",
     "linux-x86_64-deb": ".deb",
     "linux-x86_64-rpm": ".rpm",
     "linux-x86_64-appimage": ".AppImage",
 }
-WINDOWS_PLATFORMS = (
-    "windows-x86_64", "windows-x86_64-nsis", "windows-x86_64-msi"
+WINDOWS_MSI_PLATFORMS = (
+    "windows-x86_64", "windows-x86_64-msi", "windows-x86_64-nsis"
 )
 
 
-def migrate_windows_to_nsis(manifest: dict[str, Any]) -> None:
-    """Serve the same signed NSIS installer to old MSI and new NSIS clients."""
+def restore_windows_msi(manifest: dict[str, Any]) -> None:
+    """Map every Windows target to the one published, signed MSI installer.
+
+    This metadata cannot add MSI support to old EXE-only clients. Those clients
+    require a one-time manual MSI installation, as documented in release notes.
+    """
     platforms = manifest.get("platforms")
     if not isinstance(platforms, dict):
         fail("latest.json has no platforms object")
-    source = platforms.get("windows-x86_64-nsis")
+    source = platforms.get("windows-x86_64-msi")
     if not isinstance(source, dict):
-        fail("missing signed NSIS platform for Windows migration")
-    for platform in WINDOWS_PLATFORMS:
+        fail("missing signed MSI platform for Windows restoration")
+    for platform in WINDOWS_MSI_PLATFORMS:
         platforms[platform] = dict(source)
 
 
@@ -120,7 +124,7 @@ def main() -> None:
     parser.add_argument("--repository", required=True)
     parser.add_argument("--release-tag", required=True)
     parser.add_argument("--rewrite-download-urls", action="store_true")
-    parser.add_argument("--migrate-windows-to-nsis", action="store_true")
+    parser.add_argument("--restore-windows-msi", action="store_true")
     parser.add_argument("--require-signature-assets", action="store_true")
     args = parser.parse_args()
 
@@ -145,6 +149,8 @@ def main() -> None:
     for asset in assets:
         if not isinstance(asset, dict) or not isinstance(asset.get("name"), str):
             fail("release assets response contains an invalid entry")
+        if asset["name"].lower().endswith((".exe", ".exe.sig")):
+            fail("EXE installer assets are forbidden in an MSI-only release")
         asset_names.add(asset["name"])
         assets_by_name[asset["name"]] = asset
         for field in ("url", "browser_download_url"):
@@ -162,10 +168,10 @@ def main() -> None:
     if not isinstance(platforms, dict):
         fail("latest.json has no platforms object")
 
-    if args.migrate_windows_to_nsis:
+    if args.restore_windows_msi:
         if not args.rewrite_download_urls:
-            fail("--migrate-windows-to-nsis requires --rewrite-download-urls")
-        migrate_windows_to_nsis(manifest)
+            fail("--restore-windows-msi requires --rewrite-download-urls")
+        restore_windows_msi(manifest)
 
     if args.rewrite_download_urls:
         rewritten = rewrite_download_urls(
@@ -210,12 +216,10 @@ def main() -> None:
 
     windows_entries = {
         (platforms[key]["url"], platforms[key]["signature"])
-        for key in WINDOWS_PLATFORMS
+        for key in WINDOWS_MSI_PLATFORMS
     }
     if len(windows_entries) != 1:
-        fail("all Windows updater keys must use the same signed NSIS installer")
-    if any(name.lower().endswith((".msi", ".msi.zip")) for name in asset_names):
-        fail("legacy MSI installers must not be mixed into an NSIS release")
+        fail("all Windows updater keys must use the same signed MSI installer")
 
     signature_status = (
         "signature assets required"

@@ -1,5 +1,12 @@
 # 项目协作约定
 
+## Windows 安装与在线更新
+
+- 修改 Windows 安装、在线更新或发布工作流前，阅读并遵循 [Windows 发布约定](docs/WINDOWS_RELEASE_GUIDE.md)。
+- Windows 安装包只发布 MSI，并维持 MSI 安装版的软件内在线更新；不得擅自添加 EXE 安装包、替换 MSI 或删除在线更新入口。
+- 所有 Windows 安装更新项（包括历史 `nsis` 键名）必须指向同一签名 MSI。维护者已明确取消 EXE 兼容包；旧 EXE 用户需手动换装一次 MSI，必须如实说明，不能再以兼容为由恢复 EXE 发布。
+- Tauri 更新包验签与 Windows 发布者签名是不同检查；不得把前者通过写成 Smart App Control 已放行。
+
 ## 更新日志和发布说明
 
 编辑 `CHANGELOG.md`、GitHub Release 说明或应用内更新说明前，阅读并遵循 [更新日志写作指南](docs/RELEASE_NOTES_GUIDE.md)。

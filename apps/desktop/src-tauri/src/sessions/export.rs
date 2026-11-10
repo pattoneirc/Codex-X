@@ -1,7 +1,7 @@
 use super::rollout_stream::{decoded_rollout_reader, resolved_rollout_path};
 use super::storage::{
-    is_canonical_rollout_storage_path, list_session_previews_with_paths, session_project_title,
-    sqlite_candidate_paths,
+    discover_sqlite_databases, is_canonical_rollout_storage_path, list_session_previews_with_paths,
+    session_project_title,
 };
 use super::types::{RolloutScan, SessionPreview};
 use crate::error::{CodexxError, Result};
@@ -575,9 +575,24 @@ pub(crate) fn export_codex_sessions_inner(
             .ok_or_else(|| CodexxError::Config("请选择导出文件名".to_string()))?,
     );
     let snapshot = destination_snapshot(&destination)?;
-    let paths = sqlite_candidate_paths(&codex_dir);
-    let (sessions, mut warnings) =
-        list_session_previews_with_paths(&paths, &RolloutScan::default(), "openai", usize::MAX)?;
+    let (sessions, mut warnings) = if super::wsl::is_wsl_path(&codex_dir) {
+        let preview = super::wsl::session_previews(&codex_dir, "openai", usize::MAX)?;
+        (preview.sessions, Vec::new())
+    } else {
+        let discovery = discover_sqlite_databases(&codex_dir);
+        let (mut sessions, warnings) = list_session_previews_with_paths(
+            &discovery.active_paths,
+            &RolloutScan::default(),
+            "openai",
+            usize::MAX,
+        )?;
+        super::names::apply_display_names(
+            &codex_dir,
+            &discovery.active_first_related_paths(),
+            &mut sessions,
+        );
+        (sessions, warnings)
+    };
     let sessions: HashMap<_, _> = sessions
         .into_iter()
         .map(|session| (session.id.clone(), session))
@@ -737,6 +752,54 @@ mod tests {
         drop(input);
         fs::remove_file(path).unwrap();
         compressed
+    }
+
+    #[test]
+    fn current_thread_names_win_over_older_databases_in_browsing_sync_and_export() {
+        let fixture = Fixture::new();
+        fixture.add(
+            "shared",
+            "Initial prompt",
+            &[event("user", "Initial prompt")],
+            false,
+        );
+        Connection::open(&fixture.database).unwrap().execute_batch("ALTER TABLE threads ADD COLUMN name TEXT; UPDATE threads SET name='Current session name';").unwrap();
+        for (filename, name) in [
+            ("state_4.sqlite", "Old state name"),
+            ("codex-dev.db", "Old desktop name"),
+        ] {
+            let legacy = fixture.codex.join(filename);
+            fs::copy(&fixture.database, &legacy).unwrap();
+            Connection::open(legacy)
+                .unwrap()
+                .execute("UPDATE threads SET name=?1", [name])
+                .unwrap();
+        }
+        let discovery = discover_sqlite_databases(&fixture.codex);
+        assert_eq!(discovery.active_paths, vec![fixture.database.clone()]);
+        assert_ne!(discovery.related_paths[0], fixture.database);
+        assert_eq!(discovery.active_first_related_paths()[0], fixture.database);
+
+        let (sessions, _) = super::super::storage::list_session_previews(
+            &fixture.codex,
+            &RolloutScan::default(),
+            "openai",
+            100,
+        )
+        .unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].title, "Current session name");
+        let status = super::super::sync::session_sync_status_inner(
+            Some(fixture.codex.display().to_string()),
+            Some("openai".into()),
+        )
+        .unwrap();
+        assert_eq!(status.sessions[0].title, "Current session name");
+        let result = fixture.export(&["shared"], "current-name.md").unwrap();
+        assert_eq!(result.failed_sessions, 0);
+        assert!(fs::read_to_string(result.path)
+            .unwrap()
+            .starts_with("# Current session name\n"));
     }
 
     #[test]
