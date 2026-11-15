@@ -8,6 +8,18 @@
 
 日志不得包含 Token、认证文件内容、用户数据或仅适用于某台电脑的隐私路径。
 
+## 2026-11-14：Windows Store 激活身份与 PowerShell 空结果
+
+- 用户报告 Windows 11 普通重启总是出现 “Windows activated a different executable” 并伴随无有效客户端结果。代码确认旧逻辑将 ActivateApplication 返回 PID 直接当作 Electron 主进程，且仅比较路径字符串；启动器交接与 WindowsApps junction 的实际卷路径均可能被误拒绝。
+- 对照 [BigPizzaV3/CodexPlusPlus](https://github.com/BigPizzaV3/CodexPlusPlus/tree/e548ad0) 的 Windows 启动与停止策略：AUMID 激活回执不是最终桌面进程身份，路径需要解析 junction。仅参考行为独立实现，没有复制其 AGPL 源码。
+- [PowerShell 5.1 文档](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.utility/convertto-json?view=powershell-5.1) 明确说明 null 输入不输出文本。当前生产环境固定调用 Windows PowerShell 5.1，旧 Emit 在无主进程时生成空 stdout，导致 Rust JSON 解码失败，继而阻断恢复。修复由 Emit 明确返回 JSON null，不把任意无输出命令当作有效结果。
+- 新增与生产 helper 共用的隔离回归，覆盖启动器 PID、延迟主进程、无进程、其它安装拒绝及真实 Windows junction；正常客户端与调试连接仍须匹配已验证安装、当前用户/会话和创建时间，调试端口仍校验实际所有者。测试仅操作临时 fixtures，不停止用户的真实客户端。
+- [Windows 快验 43596723963](https://github.com/yynxxxxx/Codex-X/actions/runs/43596723963) 通过，Windows PowerShell 5.1 和 PowerShell 7 各执行 16 项检查，包括真实 junction 与测试宿主原生句柄绑定。本机 Rust 恢复测试 9 项、更新清单 11 项、WSL fixture 6 项、类型检查和前端构建通过。Node 195 项通过；另 2 项读取本机已安装 ChatGPT 的可选 SDK 形状测试失败，未修改的 main 上同样失败，属于本机新版 SDK 与旧测试模板不匹配；未将其记为通过或修改测试掩盖差异。
+- v0.3.34 沿用 MSI 安装与在线更新，正式发布继续执行 Windows 原生测试、MSI 安装升级检查和四平台打包。Windows 现场的实际 Store 客户端重启仍需安装新版后复测；自动化 fixture 不等于用户现场实测。
+- 首轮 [Release 43596805244](https://github.com/yynxxxxx/Codex-X/actions/runs/43596805244) 未发布：Apple 公证返回开发者协议缺失/过期的 403，维护者随后确认已处理；Windows Rust 1.100 编译完成，但测试产物变为 `target/release/build/codex-x/<hash>/out/codexx_lib-<hash>.exe`，旧 CI helper 只接受 `deps` 目录，因而在执行测试前拒绝。修正主分支的 CI helper 后使用 `workflow_dispatch` 重新构建同一草稿标签；既有发布工作流从触发提交读取 `.ci-tools`，无需移动 v0.3.34 标签或修改其应用代码。
+- [正式重建 43597851727](https://github.com/yynxxxxx/Codex-X/actions/runs/43597851727) 全部成功并公开发布 v0.3.34：Windows 838 项 Rust 测试通过，1 项手动基准忽略；195 项前端测试通过，2 项依赖本机 SDK 的检查跳过；新增 14 项 CI 测试产物路径用例通过。MSI 防重复登记、正常/重复安装、历史 MSI 升级、原生启动和配置保留验证通过；两架构 macOS 签名、公证、票据及 DMG 检查和 Linux 构建通过。
+- 公开 latest 已为 0.3.34，清单 11 个平台键完整，三个 Windows 键使用同一 MSI 和签名，资产不含 EXE 安装包。发布后清单与 6 个更新包均经标准公开地址完整下载并通过大小/SHA256 检查；Windows MSI 为 9,138,176 字节，SHA256 `c2510b43d5e7b84a4d022235f18b542de30a08379309315fe1730fd014303cb9`。这些检查不替代用户现场的真实 Codex/ChatGPT 重启复测。
+
 ## 2026-11-09：Windows 重启路径竞态与 macOS 启动恢复
 
 - 用户报告 Windows 客户端已经被关闭，随后因 CIM 进程路径不可读报错而没有重开。确认旧 StopDesktop 关闭后反复全局扫描同名进程，退出中的空路径记录会抛错；普通独立版的启动确认异常还会主动终止刚启动的进程。

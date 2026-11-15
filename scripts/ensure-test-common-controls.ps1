@@ -13,6 +13,16 @@ if ($env:GITHUB_ACTIONS -ne 'true' -or -not $env:RUNNER_TEMP) {
     throw 'This helper is restricted to an ephemeral Windows Actions runner.'
 }
 
+function Test-TestHarnessPath([string]$Executable) {
+    $normalized = [System.IO.Path]::GetFullPath($Executable).Replace('/', '\')
+    if ($normalized -match '\\(?:release|debug)\\deps\\codexx_lib-[0-9a-f]{8,32}\.exe$') {
+        return $true
+    }
+    # Cargo 1.100 reports test artifacts under build/<package>/<hash>/out.
+    # Require the selected package and the same hash in the directory and EXE.
+    return $normalized -match '\\(?:release|debug)\\build\\codex-x\\(?<artifactHash>[0-9a-f]{8,32})\\out\\codexx_lib-\k<artifactHash>\.exe$'
+}
+
 # Cargo, not a filesystem wildcard or a caller-supplied EXE, selects the target.
 $executables = @(Get-Content -LiteralPath $CargoJson | ForEach-Object {
     if (-not [string]::IsNullOrWhiteSpace($_)) {
@@ -30,9 +40,7 @@ if ($executables.Count -ne 1) {
 }
 $testExecutable = (Resolve-Path -LiteralPath $executables[0]).Path
 $testFile = Get-Item -LiteralPath $testExecutable
-if ($testFile.Name -notmatch '^codexx_lib-[0-9a-f]{8,32}\.exe$' -or
-    $testFile.Directory.Name -ne 'deps' -or
-    $testFile.Directory.Parent.Name -notin @('release', 'debug')) {
+if ($testFile.PSIsContainer -or -not (Test-TestHarnessPath $testExecutable)) {
     throw "Refusing to modify a production or non-harness executable: $testExecutable"
 }
 

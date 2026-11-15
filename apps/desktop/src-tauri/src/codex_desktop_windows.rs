@@ -78,7 +78,10 @@ fn operation_error(message: &str) -> String {
 const COMMON: &str = r#"
 function FullPath($path) { [IO.Path]::GetFullPath([string]$path).TrimEnd('\') }
 function SamePath($left, $right) {
-  [string]::Equals((FullPath $left), (FullPath $right), [StringComparison]::OrdinalIgnoreCase)
+  $left=FullPath $left; $right=FullPath $right
+  if ([string]::Equals($left,$right,[StringComparison]::OrdinalIgnoreCase)) { return $true }
+  EnsureProcessApi
+  [CodexDesktopProcess]::SamePath($left,$right)
 }
 function ProcessStamp($process) {
   if ($null -eq $process.CreationDate) { throw 'Cannot verify the process creation time.' }
@@ -103,6 +106,27 @@ public sealed class CodexDesktopProcess : IDisposable {
   [DllImport("kernel32.dll", SetLastError=true)] static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
   [DllImport("kernel32.dll", SetLastError=true)] static extern bool TerminateProcess(IntPtr handle, uint code);
   [DllImport("advapi32.dll", SetLastError=true)] static extern bool OpenProcessToken(IntPtr handle, uint access, out IntPtr token);
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern IntPtr CreateFile(string path, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern uint GetFinalPathNameByHandle(IntPtr handle, StringBuilder path, uint length, uint flags);
+  static string FinalPath(string path) {
+    // Follow directory junctions, including WindowsApps installations moved to
+    // another drive. Query metadata only and never lock the file against updates.
+    IntPtr file=CreateFile(path,0,7,IntPtr.Zero,3,0x02000000,IntPtr.Zero);
+    if(file==new IntPtr(-1)) return null;
+    try {
+      var buffer=new StringBuilder(32768);
+      uint length=GetFinalPathNameByHandle(file,buffer,(uint)buffer.Capacity,0);
+      if(length==0 || length>=buffer.Capacity) return null;
+      return buffer.ToString().TrimEnd('\\');
+    } finally { CloseHandle(file); }
+  }
+  public static bool SamePath(string left, string right) {
+    left=System.IO.Path.GetFullPath(left).TrimEnd('\\');
+    right=System.IO.Path.GetFullPath(right).TrimEnd('\\');
+    if(String.Equals(left,right,StringComparison.OrdinalIgnoreCase)) return true;
+    string resolvedLeft=FinalPath(left),resolvedRight=FinalPath(right);
+    return resolvedLeft!=null && resolvedRight!=null && String.Equals(resolvedLeft,resolvedRight,StringComparison.OrdinalIgnoreCase);
+  }
   IntPtr handle;
   public uint ProcessId { get; private set; }
   public string ExecutablePath { get; private set; }
@@ -132,7 +156,7 @@ public sealed class CodexDesktopProcess : IDisposable {
     // retained handle pins identity even if a PID is recycled after exit.
     var process=Read(pid,forStop ? 0x101001u : 0x101000u); if(process==null) return null;
     try {
-      if(!String.Equals(process.ExecutablePath,path,StringComparison.OrdinalIgnoreCase) || Math.Abs(process.CreationDate.Ticks-created)>=10) return null;
+      if(!SamePath(process.ExecutablePath,path) || Math.Abs(process.CreationDate.Ticks-created)>=10) return null;
       if(process.SessionId!=Process.GetCurrentProcess().SessionId) throw new InvalidOperationException("The desktop belongs to another Windows session.");
       IntPtr token;
       if(!OpenProcessToken(process.handle,8,out token)) throw new Win32Exception(Marshal.GetLastWin32Error());
@@ -207,6 +231,22 @@ function MainIdentity($app) {
   try { @{pid=[uint32]$entries[0].ProcessId;created=(ProcessStamp $entries[0])} }
   finally { $process.Dispose() }
 }
+function WaitForDesktopMain($app, [int]$seconds=12) {
+  $deadline=[DateTime]::UtcNow.AddSeconds($seconds)
+  do {
+    $identity=MainIdentity $app
+    if ($null -ne $identity) { return $identity }
+    if ([DateTime]::UtcNow -ge $deadline) { break }
+    Start-Sleep -Milliseconds 100
+  } while ($true)
+  throw 'Windows accepted activation, but the verified desktop main process did not appear. The launched application was not terminated.'
+}
+function TrackedProcess($app,$processId,$created) {
+  EnsureProcessApi
+  $process=[CodexDesktopProcess]::Bind([uint32]$processId,(FullPath $app.executable),[long]$created,$false)
+  if ($null -eq $process) { throw 'The activated desktop process identity has changed.' }
+  return $process
+}
 function IsDesktopExe($exe) {
   $leaf=[IO.Path]::GetFileName([string]$exe)
   ($leaf -ieq 'Codex.exe' -or $leaf -ieq 'ChatGPT.exe') -and
@@ -263,7 +303,12 @@ function ValidateApp($app, [bool]$allowElevated=$false) {
       -not (SamePath $registered.path $app.path) -or
       -not (SamePath $registered.executable $app.executable)) { throw 'The registered Store application identity has changed.' }
 }
-function Emit($result) { ConvertTo-Json -InputObject $result -Depth 6 -Compress }
+function Emit($result) {
+  # Windows PowerShell 5.1 emits no bytes for ConvertTo-Json -InputObject $null.
+  # Absence is an explicit successful observation, not a missing response.
+  if ($null -eq $result) { 'null'; return }
+  ConvertTo-Json -InputObject $result -Depth 6 -Compress
+}
 "#;
 
 // Ask the actual desktop Explorer to activate the registered Store app. Creating
@@ -553,26 +598,8 @@ fn existing_main(app: &WindowsDesktopApp) -> Result<Option<u32>, String> {
     remember_started(value).map(Some)
 }
 
-pub(crate) fn launch(
-    app: &WindowsDesktopApp,
-    home: Option<&Path>,
-    port: Option<u16>,
-) -> Result<u32, String> {
-    if let Some(home) = home {
-        validate_launch(app, home)?;
-    }
-    if app.bundle_id == "OpenAI.Codex.Standalone" {
-        return launch_standalone(app, home, port);
-    }
-    let result = powershell(
-        r#"
-ValidateApp $data.app
-if ($null -eq $data.port) {
-  $existing=MainIdentity $data.app
-  if ($null -ne $existing) { Emit $existing; return }
-} elseif (@(AppProcesses $data.app.executable).Count -gt 0) { throw 'The desktop application is still stopping; no duplicate instance was launched.' }
-$arguments=''
-if ($null -ne $data.port) { $arguments='--remote-debugging-port='+[string]$data.port+' --remote-debugging-address=127.0.0.1' }
+const STORE_ACTIVATION: &str = r#"
+function ActivateStoreApplication($app,$arguments) {
   Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
@@ -590,28 +617,39 @@ public static class CodexPackageActivation {
   }
 }
 '@ | Out-Null
-  $started=[CodexPackageActivation]::Start([string]$data.app.bundleId,$arguments)
-if ($started -eq 0) { throw 'Windows did not return an activated process id.' }
-$created=''; $deadline=[DateTime]::UtcNow.AddSeconds(8)
-do {
-  $process=$null
-  try { $process=InspectDesktopProcess $started } catch { }
-  if ($null -ne $process) {
-    try {
-      if (-not (SamePath $process.ExecutablePath $data.app.executable)) { throw 'Windows activated a different executable; no debugging connection was made.' }
-      $confirmed=BoundProcess $process $data.app.executable
-      if ($null -ne $confirmed) {
-        try { $created=ProcessStamp $process; break } finally { $confirmed.Dispose() }
-      }
-    } finally { $process.Dispose() }
-  }
-  Start-Sleep -Milliseconds 100
-} while ([DateTime]::UtcNow -lt $deadline)
-if (-not $created) { throw 'Windows accepted activation, but its process identity could not be confirmed. The launched application was not terminated.' }
-Emit @{pid=$started;created=$created}
-"#,
+  [CodexPackageActivation]::Start([string]$app.bundleId,$arguments)
+}
+function StartStore($app,$port) {
+  ValidateApp $app
+  if ($null -eq $port) {
+    $existing=MainIdentity $app
+    if ($null -ne $existing) { return $existing }
+  } elseif (@(AppProcesses $app.executable).Count -gt 0) { throw 'The desktop application is still stopping; no duplicate instance was launched.' }
+  $arguments=''
+  if ($null -ne $port) { $arguments='--remote-debugging-port='+[string]$port+' --remote-debugging-address=127.0.0.1' }
+  # Packaged activation can report a launcher/broker PID. It is not proof of
+  # the Electron process identity and must never be used as a CDP target.
+  # Activate once, then find the exact verified installation's real main process.
+  $activationPid=ActivateStoreApplication $app $arguments
+  WaitForDesktopMain $app
+}
+"#;
+
+pub(crate) fn launch(
+    app: &WindowsDesktopApp,
+    home: Option<&Path>,
+    port: Option<u16>,
+) -> Result<u32, String> {
+    if let Some(home) = home {
+        validate_launch(app, home)?;
+    }
+    if app.bundle_id == "OpenAI.Codex.Standalone" {
+        return launch_standalone(app, home, port);
+    }
+    let result = powershell(
+        &format!("{STORE_ACTIVATION}\nEmit (StartStore $data.app $data.port)"),
         json!({"app":app,"home":home,"port":port}),
-        Duration::from_secs(20),
+        Duration::from_secs(30),
     )?;
     remember_started(result)
 }
@@ -726,11 +764,11 @@ pub(crate) fn verify_process(app: &WindowsDesktopApp, pid: u32) -> Result<(), St
         .ok_or("该客户端进程不属于本次受控启动")?;
     powershell(
         r#"
-$process=Get-CimInstance Win32_Process -Filter ('ProcessId='+[uint32]$data.pid)
-if ($null -eq $process -or -not $process.ExecutablePath -or
-    -not (SamePath $process.ExecutablePath $data.app.executable) -or
-    (ProcessStamp $process) -cne [string]$data.created) { throw 'The activated desktop process identity has changed.' }
-Emit $true
+$process=TrackedProcess $data.app $data.pid $data.created
+try {
+  if ($process.HasExited) { throw 'The activated desktop process has exited.' }
+  Emit $true
+} finally { $process.Dispose() }
 "#,
         json!({"app":app,"pid":pid,"created":created}),
         Duration::from_secs(8),
@@ -747,22 +785,20 @@ pub(crate) fn verify_listener(app: &WindowsDesktopApp, pid: u32, port: u16) -> R
         .ok_or("该客户端进程不属于本次受控启动")?;
     powershell(
         r#"
-$process=Get-CimInstance Win32_Process -Filter ('ProcessId='+[uint32]$data.pid)
-if ($null -eq $process -or -not $process.ExecutablePath -or
-    -not (SamePath $process.ExecutablePath $data.app.executable) -or
-    (ProcessStamp $process) -cne [string]$data.created) { throw 'The activated desktop process identity has changed.' }
-$listeners=@(Get-NetTCPConnection -State Listen -LocalPort ([uint16]$data.port) -ErrorAction SilentlyContinue)
-if ($listeners.Count -eq 0) { throw 'The official desktop has not opened its debugging port.' }
-foreach ($listener in $listeners) {
-  if ($listener.LocalAddress -cne '127.0.0.1' -or [uint32]$listener.OwningProcess -ne [uint32]$data.pid) {
-    throw 'The debugging port is not exclusively owned by the activated process on 127.0.0.1.'
+$process=TrackedProcess $data.app $data.pid $data.created
+try {
+  $listeners=@(Get-NetTCPConnection -State Listen -LocalPort ([uint16]$data.port) -ErrorAction SilentlyContinue)
+  if ($listeners.Count -eq 0) { throw 'The official desktop has not opened its debugging port.' }
+  foreach ($listener in $listeners) {
+    if ($listener.LocalAddress -cne '127.0.0.1' -or [uint32]$listener.OwningProcess -ne [uint32]$data.pid) {
+      throw 'The debugging port is not exclusively owned by the activated process on 127.0.0.1.'
+    }
   }
-}
-$after=Get-CimInstance Win32_Process -Filter ('ProcessId='+[uint32]$data.pid)
-if ($null -eq $after -or -not $after.ExecutablePath -or
-    -not (SamePath $after.ExecutablePath $data.app.executable) -or
-    (ProcessStamp $after) -cne [string]$data.created) { throw 'The desktop process changed while its port was being verified.' }
-Emit $true
+  # The retained handle pins the original process even if its PID is recycled
+  # while inspecting the listener. CIM timestamps lose sub-microsecond ticks.
+  if ($process.HasExited) { throw 'The desktop process changed while its port was being verified.' }
+  Emit $true
+} finally { $process.Dispose() }
 "#,
         json!({"app":app,"pid":pid,"port":port,"created":created}),
         Duration::from_secs(8),
@@ -1077,6 +1113,154 @@ function BoundProcess($entry,$exe,$forStop) {
   $value
 }
 "#;
+
+    const ACTIVATION_FIXTURES: &str = r#"
+$global:activationCalls=0; $global:activationArguments=''; $global:rows=@(); $global:activated=$false
+function ValidateApp { }
+function ActivateStoreApplication($app,$arguments) {
+  $global:activationCalls++; $global:activationArguments=$arguments; $global:activated=$true
+  900
+}
+function BoundProcess($entry,$exe) {
+  if (-not (SamePath $entry.ExecutablePath $exe)) { throw 'fixture: wrong executable was bound' }
+  $value=[pscustomobject]@{ProcessId=$entry.ProcessId;HasExited=$false}
+  $value | Add-Member -MemberType ScriptMethod -Name Dispose -Value {}
+  $value
+}
+"#;
+
+    const NULL_RESULT_FIXTURE: &str = r#"
+function MainProcesses { }
+$emptyMain=Emit (MainIdentity $data.app)
+$explicit=Emit $null
+Emit @{emptyMain=$emptyMain;explicit=$explicit;emptyArray=(Emit @());falseValue=(Emit $false)}
+"#;
+
+    const PATH_IDENTITY_FIXTURE: &str = r#"
+$temporary=Join-Path ([IO.Path]::GetTempPath()) ('codexx-path-'+[Guid]::NewGuid().ToString('N'))
+$null=New-Item -ItemType Directory -Path $temporary
+$alias=Join-Path $temporary 'host-alias'
+$live=$null; $bound=$null
+try {
+  $live=InspectDesktopProcess $PID
+  $directory=[IO.Path]::GetDirectoryName($live.ExecutablePath)
+  $null=New-Item -ItemType Junction -Path $alias -Target $directory
+  $throughAlias=Join-Path $alias ([IO.Path]::GetFileName($live.ExecutablePath))
+  $other=Join-Path $temporary ([IO.Path]::GetFileName($live.ExecutablePath))
+  [IO.File]::WriteAllText($other,'a different file with the same basename')
+  $bound=[CodexDesktopProcess]::Bind([uint32]$PID,$throughAlias,$live.CreationDate.Ticks,$false)
+  Emit @{same=(SamePath $throughAlias $live.ExecutablePath);different=(SamePath $other $live.ExecutablePath);
+    directory=(SamePath $alias $directory);bound=($null -ne $bound -and -not $bound.HasExited)}
+} finally {
+  if ($null -ne $bound) { $bound.Dispose() }
+  if ($null -ne $live) { $live.Dispose() }
+  # Remove the junction itself without traversing the host installation.
+  if (Test-Path -LiteralPath $alias) { [IO.Directory]::Delete($alias) }
+  Remove-Item -LiteralPath $temporary -Recurse -Force
+}
+"#;
+
+    fn activation_fixture(script: &str) -> Value {
+        powershell(
+            &format!("{STORE_ACTIVATION}\n{PROCESS_FIXTURES}\n{ACTIVATION_FIXTURES}\n{script}"),
+            json!({"app":{"executable":"C:\\fixture\\Codex.exe","bundleId":"OpenAI.Codex_2p2nqsd0c76g0!App"}}),
+            Duration::from_secs(15),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn store_activation_tracks_desktop_main_instead_of_launcher_pid() {
+        let result = activation_fixture(
+            r#"
+function Get-CimInstance {
+  $global:queries++
+  if ($global:queries -ge 3) { Entry 4242 'C:\fixture\Codex.exe' }
+  Entry 900 'C:\Windows\ActivationHost.exe'
+}
+$identity=StartStore $data.app $null
+Emit @{pid=$identity.pid;created=($identity.created -ceq (ProcessStamp (Entry 4242 'C:\fixture\Codex.exe')));
+  calls=$global:activationCalls;queries=$global:queries}
+"#,
+        );
+        assert_eq!(
+            result,
+            json!({"pid":4242,"created":true,"calls":1,"queries":3})
+        );
+    }
+
+    #[test]
+    fn store_activation_rejects_unrelated_executable() {
+        let result = activation_fixture(
+            r#"
+$global:rows=@(Entry 4242 'C:\other-installation\Codex.exe')
+$wait=${function:WaitForDesktopMain}
+function WaitForDesktopMain($app) { & $wait $app 0 }
+try { StartStore $data.app $null; throw 'unexpected success' }
+catch {
+  Emit @{rejected=$_.Exception.Message.Contains('verified desktop main process did not appear');calls=$global:activationCalls}
+}
+"#,
+        );
+        assert_eq!(result, json!({"rejected":true,"calls":1}));
+    }
+
+    #[test]
+    fn store_activation_does_not_duplicate_an_existing_main() {
+        let result = activation_fixture(
+            r#"
+$global:rows=@(Entry 4242 'C:\fixture\Codex.exe')
+$identity=StartStore $data.app $null
+Emit @{pid=$identity.pid;calls=$global:activationCalls}
+"#,
+        );
+        assert_eq!(result, json!({"pid":4242,"calls":0}));
+    }
+
+    #[test]
+    fn store_activation_preserves_debug_arguments() {
+        let result = activation_fixture(
+            r#"
+function Get-CimInstance {
+  if ($global:activated) { Entry 4242 'C:\fixture\Codex.exe' }
+}
+$identity=StartStore $data.app 49152
+Emit @{pid=$identity.pid;calls=$global:activationCalls;arguments=$global:activationArguments}
+"#,
+        );
+        assert_eq!(
+            result,
+            json!({"pid":4242,"calls":1,"arguments":"--remote-debugging-port=49152 --remote-debugging-address=127.0.0.1"})
+        );
+    }
+
+    #[test]
+    fn empty_main_identity_emits_explicit_json_null() {
+        let result = powershell(
+            NULL_RESULT_FIXTURE,
+            json!({"app":{"executable":"C:\\fixture\\Codex.exe"}}),
+            Duration::from_secs(15),
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            json!({"emptyMain":"null","explicit":"null","emptyArray":"[]","falseValue":"false"})
+        );
+        assert_eq!(
+            powershell("Emit $null", Value::Null, Duration::from_secs(15)).unwrap(),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn native_path_identity_resolves_junctions_and_rejects_other_files() {
+        let result =
+            powershell(PATH_IDENTITY_FIXTURE, Value::Null, Duration::from_secs(15)).unwrap();
+        assert_eq!(
+            result,
+            json!({"same":true,"different":false,"directory":true,"bound":true})
+        );
+    }
 
     fn process_fixture(script: &str, stop: bool) -> Value {
         powershell(

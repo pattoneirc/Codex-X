@@ -69,6 +69,59 @@ foreach ($case in $storeCases) {
   }
   Write-Host "Passed: $($case.Name)"
 }
+# Exercise the same ordinary Store activation helpers used by restart and CDP.
+# Activation is mocked; the reported launcher PID deliberately differs from
+# the desktop PID. Enumeration and main-process selection remain production code.
+$activation = Constant 'STORE_ACTIVATION'
+$activationFixtures = Constant 'ACTIVATION_FIXTURES'
+$activationCases = @(
+  @{Name='store_activation_tracks_desktop_main_instead_of_launcher_pid';Expected=@{pid=4242;created=$true;calls=1;queries=3}},
+  @{Name='store_activation_rejects_unrelated_executable';Expected=@{rejected=$true;calls=1}},
+  @{Name='store_activation_does_not_duplicate_an_existing_main';Expected=@{pid=4242;calls=0}},
+  @{Name='store_activation_preserves_debug_arguments';Expected=@{pid=4242;calls=1;arguments='--remote-debugging-port=49152 --remote-debugging-address=127.0.0.1'}}
+)
+foreach ($case in $activationCases) {
+  $start=$source.IndexOf('fn '+$case.Name+'(')
+  if ($start -lt 0) { throw "Missing activation fixture: $($case.Name)" }
+  $match=[regex]::Match($source.Substring($start), '(?s)activation_fixture\(\s*r#"(.*?)"#\s*,?\s*\)')
+  if (-not $match.Success) { throw "Cannot extract activation fixture: $($case.Name)" }
+  $result = & {
+    $data=[pscustomobject]@{app=[pscustomobject]@{executable='C:\fixture\Codex.exe';bundleId='OpenAI.Codex_2p2nqsd0c76g0!App'}}
+    . ([scriptblock]::Create($common))
+    . ([scriptblock]::Create($activation))
+    . ([scriptblock]::Create($fixtures))
+    . ([scriptblock]::Create($activationFixtures))
+    . ([scriptblock]::Create($match.Groups[1].Value))
+  }
+  $actual = ($result -join "`n") | ConvertFrom-Json
+  foreach ($key in $case.Expected.Keys) {
+    $left=ConvertTo-Json -InputObject $actual.$key -Compress
+    $right=ConvertTo-Json -InputObject $case.Expected[$key] -Compress
+    if ($left -cne $right) { throw "$($case.Name): $key returned $left, expected $right" }
+  }
+  Write-Host "Passed: $($case.Name)"
+}
+# Check exact serialized absence on PowerShell 5.1, and real junction identity
+# through both path matching and native binding to this test host's own PID.
+$identityCases = @(
+  @{Name='NULL_RESULT_FIXTURE';Expected=@{emptyMain='null';explicit='null';emptyArray='[]';falseValue='false'}},
+  @{Name='PATH_IDENTITY_FIXTURE';Expected=@{same=$true;different=$false;directory=$true;bound=$true}}
+)
+foreach ($case in $identityCases) {
+  $script=Constant $case.Name
+  $result = & {
+    $data=[pscustomobject]@{app=[pscustomobject]@{executable='C:\fixture\Codex.exe'}}
+    . ([scriptblock]::Create($common))
+    . ([scriptblock]::Create($script))
+  }
+  $actual = ($result -join "`n") | ConvertFrom-Json
+  foreach ($key in $case.Expected.Keys) {
+    $left=ConvertTo-Json -InputObject $actual.$key -Compress
+    $right=ConvertTo-Json -InputObject $case.Expected[$key] -Compress
+    if ($left -cne $right) { throw "$($case.Name): $key returned $left, expected $right" }
+  }
+  Write-Host "Passed: $($case.Name)"
+}
 # Exercise actual limited-query Windows APIs only against this test host itself.
 . ([scriptblock]::Create($common))
 EnsureProcessApi

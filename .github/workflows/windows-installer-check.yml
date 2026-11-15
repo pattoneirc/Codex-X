@@ -34,6 +34,9 @@ jobs:
       - name: Check PowerShell 7 compatibility
         shell: pwsh
         run: ./scripts/test_windows_desktop_restart.ps1
+      - name: Check Cargo test artifact layouts
+        shell: pwsh
+        run: ./scripts/test_windows_test_harness_path.ps1
 
   windows-installer:
     name: Verify Windows update migration

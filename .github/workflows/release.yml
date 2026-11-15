@@ -192,9 +192,16 @@ jobs:
         with:
           ref: ${{ github.sha }}
           path: .ci-tools
-          sparse-checkout: scripts/ensure-test-common-controls.ps1
+          sparse-checkout: |
+            scripts/ensure-test-common-controls.ps1
+            scripts/test_windows_test_harness_path.ps1
           sparse-checkout-cone-mode: false
           persist-credentials: false
+
+      - name: Verify Windows Cargo test artifact layouts
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: ./.ci-tools/scripts/test_windows_test_harness_path.ps1
 
       - name: Verify Windows desktop restart process handling
         if: matrix.platform == 'windows-latest'
