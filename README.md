@@ -13,6 +13,11 @@
   一款面向 **OpenAI Codex 桌面端 / Codex CLI** 的跨平台桌面工具。把提示词模板、自定义 Prompt、第三方 API 供应商、会话同步、Skills / MCP 和 TOML 配置都放进可视化界面里，不用反复手改文件。
 
   <p>
+    <a href="https://trendshift.io/repositories/104938"><img src="https://trendshift.io/api/badge/repositories/104938" alt="GitHub Trending Rust 日榜第 2 名" width="250" height="55" /></a><br />
+    <sub><a href="https://github.com/antonkomarev/github-trending-archive/blob/aeea175a90b86aba1844727221cf2aaa8decd908/archive/repository/2026/2026-09-20/rust.json">Rust 日榜第 2 名 · 2026-09-20</a></sub>
+  </p>
+
+  <p>
     <img src="https://img.shields.io/github/v/release/yynxxxxx/Codex-X?label=version&color=blue" alt="version" />
     <img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-555" alt="platform" />
     <img src="https://img.shields.io/badge/built%20with-Tauri%202-24C8DB" alt="tauri" />
@@ -45,38 +50,81 @@
 
 ## 软件预览
 
-<details open>
-<summary><b>新版 UI：指令提示词管理中心</b></summary>
+以下截图来自 Codex-X v0.3.35，使用 Atlas Studio 演示工作区。点击图片可查看原图。
 
 <p align="center">
-  <img src="docs/screenshots/app/new-ui/prompts.png" alt="Codex-X 新版指令提示词管理界面" width="920" />
+  <a href="docs/screenshots/app/v0.3.35/zh/sessions.webp"><img src="docs/screenshots/app/v0.3.35/zh/sessions.webp" alt="会话管理 · 按项目文件夹浏览历史会话" width="1040" /></a><br />
+  <b>会话管理</b> · 按项目文件夹浏览历史会话
 </p>
 
-</details>
-
-<div align="center">
 <table>
   <tr>
-    <td align="center" width="50%">
-      <b>分类管理</b><br />
-      <sub>把提示词按破甲 / 逆向、软件开发、写作辅助等分类维护</sub><br />
-      <img src="docs/screenshots/app/new-ui/prompt-categories.png" alt="Codex-X 提示词分类管理" width="420" />
+    <td width="50%" valign="top">
+      <a href="docs/screenshots/app/v0.3.35/zh/overview.webp"><img src="docs/screenshots/app/v0.3.35/zh/overview.webp" alt="概览 · 查看当前模型、供应商和配置目录" width="480" /></a><br />
+      <b>概览</b><br />
+      <sub>查看当前模型、供应商和配置目录</sub>
     </td>
-    <td align="center" width="50%">
-      <b>自定义提示词</b><br />
-      <sub>直接添加、编辑或导入自己的 Markdown 提示词</sub><br />
-      <img src="docs/screenshots/app/new-ui/prompt-form.png" alt="Codex-X 添加自定义提示词" width="420" />
+    <td width="50%" valign="top">
+      <a href="docs/screenshots/app/v0.3.35/zh/providers.webp"><img src="docs/screenshots/app/v0.3.35/zh/providers.webp" alt="供应商 · 管理官方账号和第三方 API" width="480" /></a><br />
+      <b>供应商</b><br />
+      <sub>管理官方账号和第三方 API</sub>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <a href="docs/screenshots/app/v0.3.35/zh/prompts.webp"><img src="docs/screenshots/app/v0.3.35/zh/prompts.webp" alt="指令提示词 · 按分类选择和启用提示词" width="480" /></a><br />
+      <b>指令提示词</b><br />
+      <sub>按分类选择和启用提示词</sub>
+    </td>
+    <td width="50%" valign="top">
+      <a href="docs/screenshots/app/v0.3.35/zh/usage.webp"><img src="docs/screenshots/app/v0.3.35/zh/usage.webp" alt="用量统计 · 查看近七天的 Token 用量和模型分布" width="480" /></a><br />
+      <b>用量统计</b><br />
+      <sub>查看近七天的 Token 用量和模型分布</sub>
     </td>
   </tr>
 </table>
-</div>
 
 <details>
-<summary><b>Skills / MCP 可视化管理</b></summary>
+<summary><b>展开查看 Skills、MCP、TOML、路由、设置和关于</b></summary>
 
-<p align="center">
-  <img src="docs/screenshots/app/new-ui/skills-mcp.png" alt="Codex-X Skills 与 MCP 管理界面" width="920" />
-</p>
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <a href="docs/screenshots/app/v0.3.35/zh/skills.webp"><img src="docs/screenshots/app/v0.3.35/zh/skills.webp" alt="Skills · 查看和启用工作区技能" width="480" /></a><br />
+      <b>Skills</b><br />
+      <sub>查看和启用工作区技能</sub>
+    </td>
+    <td width="50%" valign="top">
+      <a href="docs/screenshots/app/v0.3.35/zh/mcp.webp"><img src="docs/screenshots/app/v0.3.35/zh/mcp.webp" alt="MCP · 管理本地与远程 MCP 服务" width="480" /></a><br />
+      <b>MCP</b><br />
+      <sub>管理本地与远程 MCP 服务</sub>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <a href="docs/screenshots/app/v0.3.35/zh/toml.webp"><img src="docs/screenshots/app/v0.3.35/zh/toml.webp" alt="TOML · 查看当前生效的配置" width="480" /></a><br />
+      <b>TOML</b><br />
+      <sub>查看当前生效的配置</sub>
+    </td>
+    <td width="50%" valign="top">
+      <a href="docs/screenshots/app/v0.3.35/zh/routing.webp"><img src="docs/screenshots/app/v0.3.35/zh/routing.webp" alt="路由与故障转移 · 查看主备供应商的优先级和状态" width="480" /></a><br />
+      <b>路由与故障转移</b><br />
+      <sub>查看主备供应商的优先级和状态</sub>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <a href="docs/screenshots/app/v0.3.35/zh/settings.webp"><img src="docs/screenshots/app/v0.3.35/zh/settings.webp" alt="通用设置 · 切换语言并查看环境检查结果" width="480" /></a><br />
+      <b>通用设置</b><br />
+      <sub>切换语言并查看环境检查结果</sub>
+    </td>
+    <td width="50%" valign="top">
+      <a href="docs/screenshots/app/v0.3.35/zh/about.webp"><img src="docs/screenshots/app/v0.3.35/zh/about.webp" alt="关于 · 查看版本和更新状态" width="480" /></a><br />
+      <b>关于</b><br />
+      <sub>查看版本和更新状态</sub>
+    </td>
+  </tr>
+</table>
 
 </details>
 
@@ -141,7 +189,7 @@
 
 Codex-X 现在不只是“几套内置 Prompt”的启动器，而是一个可视化提示词注入与管理工具：
 
-- 按分类管理提示词，例如破甲 / 逆向、软件开发、写作辅助，也可以新增自己的分类
+- 按分类管理提示词，例如软件开发、写作辅助，也可以新增自己的分类
 - 支持同步 GitHub 模板、导入 Markdown、手动添加提示词、编辑标题 / 文件名 / 内容
 - 每个提示词都有独立开关，打开时自动按当前启用方式写入 Codex 指令文件
 - 支持“保留原提示词”和“替换原提示词”两种模式，适合日常叠加或完整切换
@@ -153,31 +201,6 @@ Codex-X 现在不只是“几套内置 Prompt”的启动器，而是一个可�
     <th align="center">模板</th>
     <th align="center">适合场景</th>
     <th align="center">获取方式</th>
-  </tr>
-  <tr>
-    <td><a href="examples/gpt5.5-unrestricted.md"><code>gpt5.5-unrestricted.md</code></a></td>
-    <td align="left">短小通用，适合日常 coding 与常规技术任务</td>
-    <td align="center">离线内置<br />GitHub 更新</td>
-  </tr>
-  <tr>
-    <td><a href="examples/gpt5.4-unrestricted.md"><code>gpt5.4-unrestricted.md</code></a></td>
-    <td align="left">面向 GPT-5.4 / Codex CLI，偏 CTF 与安全研究工作流</td>
-    <td align="center">离线内置<br />GitHub 更新</td>
-  </tr>
-  <tr>
-    <td><a href="examples/gpt5.5-jeli.md"><code>gpt5.5-jeli.md</code></a></td>
-    <td align="left">大白话通用版，提供更完整的工程与逆向执行流程</td>
-    <td align="center">离线内置<br />GitHub 更新</td>
-  </tr>
-  <tr>
-    <td><a href="examples/gpt-5.6-sol-unrestricted.md"><code>gpt-5.6-sol-unrestricted.md</code></a></td>
-    <td align="left">gpt5.6-sol 破甲提示词，偏直接执行与中英文任务</td>
-    <td align="center">离线内置<br />GitHub 更新</td>
-  </tr>
-  <tr>
-    <td><a href="examples/%E6%B5%B7%E9%B8%A53.0%E7%A0%B4%E7%94%B2.md"><code>海鸥3.0破甲.md</code></a></td>
-    <td align="left">中文技术操作员人格，覆盖 coding、CTF、逆向、内存与协议任务路由</td>
-    <td align="center">离线内置<br />GitHub 更新</td>
   </tr>
   <tr>
     <td><a href="examples/software-development-maintainer.md"><code>software-development-maintainer.md</code></a></td>
@@ -245,7 +268,7 @@ Codex-X 现在不只是“几套内置 Prompt”的启动器，而是一个可�
 
 ### 3. 会话管理：同步、检查与永久删除
 
-会话列表优先显示已设置的名称，悬停可看首次提示词。Windows 支持只读查看和导出 WSL 会话，使用条件和限制见 [WSL 会话说明](docs/WSL_SESSIONS.md)。
+会话列表优先显示会话名称，鼠标悬停在会话行上可预览首次提示词。在 Windows 中选择 WSL 的 `.codex` 目录，点击「检查会话」即可查看或导出已有会话。[WSL 会话使用说明](docs/WSL_SESSIONS.md)
 
 <table>
   <tr>
@@ -297,44 +320,7 @@ Codex-X 现在不只是“几套内置 Prompt”的启动器，而是一个可�
 - Provider 编辑页可直接编辑完整 TOML
 - 保存后同步到 Codex 配置目录
 
-### 6. 逆向 Skills 导航
-
-<div align="center">
-  <a href="https://yynxxxxx.github.io/Codex-X/">
-    <img src="https://img.shields.io/badge/Codex--X-在线逆向%20Skills%20导航-0ea5e9?style=for-the-badge&logo=githubpages&logoColor=white" alt="Codex-X 在线逆向 Skills 导航" />
-  </a>
-</div>
-
-<br />
-
-<table>
-  <tr>
-    <td width="55%">
-      <b>在线教程页</b>：解释什么是“破甲”、Codex-X 如何启用 GPT-5.5 / unrestricted jeli、以及如何搭配不同领域的逆向 Skills。
-      <br /><br />
-      <b>分类覆盖</b>：Android APK / Windows EXE / Web 协议逆向。
-      <br /><br />
-      <b>内容包含</b>：Skill 用途、安装方式、来源地址、推荐使用流程。
-    </td>
-    <td width="45%">
-      <ul>
-        <li>🧩 GPT-5.5 / unrestricted jeli 使用流程</li>
-        <li>📱 Android APK 逆向 Skills</li>
-        <li>🪟 Windows EXE / DLL 逆向 Skills</li>
-        <li>🌐 Web / API / 协议逆向 Skills</li>
-        <li>📋 安装命令一键复制</li>
-      </ul>
-    </td>
-  </tr>
-</table>
-
-<p align="center">
-  <a href="https://yynxxxxx.github.io/Codex-X/">
-    <b>🚀 打开 Codex-X 逆向 Skills 导航</b>
-  </a>
-</p>
-
-### 7. 跨平台桌面软件
+### 6. 跨平台桌面软件
 
 - macOS Apple Silicon `.dmg`
 - macOS Intel `.dmg`
@@ -401,14 +387,7 @@ pnpm --dir apps/desktop tauri build
 
 ## 桌面端安装说明
 
-如果你在未签名 / 未公证的 DMG 中看到“软件已损坏”提示，这是 macOS Gatekeeper 的正常行为。
-
-- 最佳方式：使用 Apple Developer ID 签名并 notarize
-- 仅本地测试：可手动移除 quarantine 属性
-
-```bash
-xattr -dr com.apple.quarantine /Applications/Codex-X.app
-```
+macOS 正式版 DMG 已通过 Apple 签名和公证。请按芯片架构选择 Apple Silicon 或 Intel 版本。
 
 ## 许可证
 
