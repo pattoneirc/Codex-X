@@ -13,8 +13,10 @@
   一款面向 **OpenAI Codex 桌面端 / Codex CLI** 的跨平台桌面工具。把提示词模板、自定义 Prompt、第三方 API 供应商、会话同步、Skills / MCP 和 TOML 配置都放进可视化界面里，不用反复手改文件。
 
   <p>
-    <a href="https://trendshift.io/repositories/104938"><img src="https://trendshift.io/api/badge/repositories/104938" alt="GitHub Trending Rust 日榜第 2 名" width="250" height="55" /></a><br />
-    <sub><a href="https://github.com/antonkomarev/github-trending-archive/blob/aeea175a90b86aba1844727221cf2aaa8decd908/archive/repository/2026/2026-09-20/rust.json">Rust 日榜第 2 名 · 2026-09-20</a></sub>
+    <a href="https://github.com/antonkomarev/github-trending-archive/blob/80b65ba24e649d0a2ce2c6bad776ce1284312a4a/archive/repository/2026/2026-09-22/%28null%29.json" title="GitHub Trending 全球日榜第 12 名（2026-09-22）"><img src="https://img.shields.io/badge/GitHub%20Trending-Global%20%2312-24292f?logo=github&amp;logoColor=white" alt="GitHub Trending 全球日榜第 12 名（2026-09-22）" width="210" align="middle" /></a>
+    &nbsp;
+    <a href="https://trendshift.io/repositories/104938"><img src="https://trendshift.io/api/badge/repositories/104938" alt="GitHub Trending Rust 日榜第 2 名" width="210" align="middle" /></a><br />
+    <sub><a href="https://github.com/antonkomarev/github-trending-archive/blob/aeea175a90b86aba1844727221cf2aaa8decd908/archive/repository/2026/2026-09-20/rust.json">Rust 日榜第 2 · 2026-09-20</a> · <a href="https://github.com/hanishrao/trending-collection/blob/5e670f30866729b5a3b2c8e550836cca5f69de98/api/weekly/rust.json#L19">Rust 周榜第 2 · 2026-09-27</a></sub>
   </p>
 
   <p>
@@ -169,6 +171,19 @@
     <td align="left">提供 macOS Apple Silicon / Intel、Windows MSI / 便携版和 Linux 安装包；MSI 安装版可在应用内直接下载、校验并安装更新，便携版继续使用手动下载。</td>
   </tr>
 </table>
+</div>
+
+## 交流
+
+用 QQ 扫描任一二维码，加入 AI 技术交流群。
+
+<div align="center">
+  <table>
+    <tr>
+      <td align="center"><b>QQ AI 技术交流群 1</b><br /><a href="docs/community/qq-group-1.png"><img src="docs/community/qq-group-1.png" alt="QQ AI 技术交流群 1 二维码" width="240" /></a></td>
+      <td align="center"><b>QQ AI 技术交流群 2</b><br /><a href="docs/community/qq-group-2.png"><img src="docs/community/qq-group-2.png" alt="QQ AI 技术交流群 2 二维码" width="240" /></a></td>
+    </tr>
+  </table>
 </div>
 
 ## 核心亮点
